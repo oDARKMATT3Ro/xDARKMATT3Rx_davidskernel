@@ -146,6 +146,12 @@ config CPU_FREQ_DEFAULT_GOV_LIONHEART
             help
               Use the CPUFreq governor 'lionheart' as default.
 
+config CPU_FREQ_DEFAULT_GOV_ONDEMANDPLUS
+	bool "ondemandplus"
+	select CPU_FREQ_GOV_ONDEMANDPLUS
+	help
+	Use the CPUFreq governor 'ondemandplus' as default.
+
 config CPU_FREQ_DEFAULT_GOV_SMARTMAX_EPS
         bool "smartmax_eps"
         select CPU_FREQ_GOV_SMARTMAX_EPS
@@ -279,6 +285,10 @@ config CPU_FREQ_GOV_LIONHEART
            help
              lionheart' - a "smart" optimized governor!
              If in doubt, say N.
+	  
+config CPU_FREQ_GOV_ONDEMANDPLUS
+	tristate "'ondemandplus' cpufreq governor"
+	depends on CPU_FREQ
 
 config CPU_FREQ_GOV_CONSERVATIVE
 	tristate "'conservative' cpufreq governor"
