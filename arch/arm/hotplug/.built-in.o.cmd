@@ -1,1 +1,0 @@
-cmd_arch/arm/hotplug/built-in.o :=  /home/xdarkmatt3rx/android/toolchains/arm-eabi-4.9/bin/arm-eabi-ld -EL    -r -o arch/arm/hotplug/built-in.o arch/arm/hotplug/intelli_plug.o arch/arm/hotplug/msm_zen_decision.o arch/arm/hotplug/autosmp.o arch/arm/hotplug/msm-sleeper.o arch/arm/hotplug/bricked_hotplug.o 
