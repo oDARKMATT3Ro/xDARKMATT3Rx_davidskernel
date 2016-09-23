@@ -1,1 +1,0 @@
-cmd_drivers/battery/built-in.o :=  /home/xdarkmatt3rx/android/toolchains/arm-eabi-4.9/bin/arm-eabi-ld -EL    -r -o drivers/battery/built-in.o drivers/battery/sec_battery.o drivers/battery/sec_board-msm8974.o drivers/battery/max17050_fuelgauge.o drivers/battery/sec_fuelgauge.o drivers/battery/bq24260_charger.o 

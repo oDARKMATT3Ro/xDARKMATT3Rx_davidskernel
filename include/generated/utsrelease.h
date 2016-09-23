@@ -1,1 +1,0 @@
-#define UTS_RELEASE "3.4.0xDARKMATT3Rx-g83469a7"
