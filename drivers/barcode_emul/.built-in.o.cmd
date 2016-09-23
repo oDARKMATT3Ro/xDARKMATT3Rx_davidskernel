@@ -1,0 +1,1 @@
+cmd_drivers/barcode_emul/built-in.o :=  /home/xdarkmatt3rx/android/toolchains/arm-eabi-4.9/bin/arm-eabi-ld -EL    -r -o drivers/barcode_emul/built-in.o drivers/barcode_emul/barcode_emul_ice4.o drivers/barcode_emul/barcode_emul_ice4_hlte.o 
