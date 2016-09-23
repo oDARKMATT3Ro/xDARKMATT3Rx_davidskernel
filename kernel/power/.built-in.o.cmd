@@ -1,0 +1,1 @@
+cmd_kernel/power/built-in.o :=  /home/xdarkmatt3rx/android/toolchains/arm-eabi-4.9/bin/arm-eabi-ld -EL    -r -o kernel/power/built-in.o kernel/power/qos.o kernel/power/main.o kernel/power/process.o kernel/power/suspend.o kernel/power/powersuspend.o kernel/power/autosleep.o kernel/power/wakelock.o kernel/power/quickwakeup.o kernel/power/poweroff.o kernel/power/wakeup_reason.o 
