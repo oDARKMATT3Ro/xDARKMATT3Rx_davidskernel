@@ -4,7 +4,7 @@
  *  Copyright (C)  2001 Russell King
  *            (C)  2003 Venkatesh Pallipadi <venkatesh.pallipadi@intel.com>.
  *                      Jun Nakajima <jun.nakajima@intel.com>
- *            (c)  2013, 2015 The Linux Foundation. All rights reserved.
+ *            (c)  2013 The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 as
@@ -120,7 +120,6 @@ struct cpu_dbs_info_s {
 	struct task_struct *sync_thread;
 	wait_queue_head_t sync_wq;
 	atomic_t src_sync_cpu;
-	atomic_t being_woken;
 	atomic_t sync_enabled;
 };
 static DEFINE_PER_CPU(struct cpu_dbs_info_s, od_cpu_dbs_info);
@@ -185,6 +184,40 @@ static struct dbs_tuners {
 	.sampling_interim_factor = DEF_SAMPLING_INTERIM_HISPEED_FACTOR,
 #endif
 };
+
+static inline u64 get_cpu_idle_time_jiffy(unsigned int cpu, u64 *wall)
+{
+	u64 idle_time;
+	u64 cur_wall_time;
+	u64 busy_time;
+
+	cur_wall_time = jiffies64_to_cputime64(get_jiffies_64());
+
+	busy_time  = kcpustat_cpu(cpu).cpustat[CPUTIME_USER];
+	busy_time += kcpustat_cpu(cpu).cpustat[CPUTIME_SYSTEM];
+	busy_time += kcpustat_cpu(cpu).cpustat[CPUTIME_IRQ];
+	busy_time += kcpustat_cpu(cpu).cpustat[CPUTIME_SOFTIRQ];
+	busy_time += kcpustat_cpu(cpu).cpustat[CPUTIME_STEAL];
+	busy_time += kcpustat_cpu(cpu).cpustat[CPUTIME_NICE];
+
+	idle_time = cur_wall_time - busy_time;
+	if (wall)
+		*wall = jiffies_to_usecs(cur_wall_time);
+
+	return jiffies_to_usecs(idle_time);
+}
+
+static inline cputime64_t get_cpu_idle_time(unsigned int cpu, cputime64_t *wall)
+{
+	u64 idle_time = get_cpu_idle_time_us(cpu, NULL);
+
+	if (idle_time == -1ULL)
+		return get_cpu_idle_time_jiffy(cpu, wall);
+	else
+		idle_time += get_cpu_iowait_time_us(cpu, wall);
+
+	return idle_time;
+}
 
 static inline cputime64_t get_cpu_iowait_time(unsigned int cpu, cputime64_t *wall)
 {
@@ -407,10 +440,6 @@ static ssize_t store_input_boost(struct kobject *a, struct attribute *b,
 {
 	unsigned int input;
 	int ret;
-
-	if (sysfs_streq(current->comm, "mpdecision"))
-		return -EINVAL;
-
 	ret = sscanf(buf, "%u", &input);
 	if (ret != 1)
 		return -EINVAL;
@@ -423,9 +452,6 @@ static ssize_t store_sync_freq(struct kobject *a, struct attribute *b,
 {
 	unsigned int input;
 	int ret;
-
-	if (sysfs_streq(current->comm, "mpdecision"))
-		return -EINVAL;
 
 	ret = sscanf(buf, "%u", &input);
 	if (ret != 1)
@@ -581,7 +607,7 @@ static ssize_t store_ignore_nice_load(struct kobject *a, struct attribute *b,
 		struct cpu_dbs_info_s *dbs_info;
 		dbs_info = &per_cpu(od_cpu_dbs_info, j);
 		dbs_info->prev_cpu_idle = get_cpu_idle_time(j,
-						&dbs_info->prev_cpu_wall, dbs_tuners_ins.io_is_busy);
+						&dbs_info->prev_cpu_wall);
 		if (dbs_tuners_ins.ignore_nice)
 			dbs_info->prev_cpu_nice = kcpustat_cpu(j).cpustat[CPUTIME_NICE];
 
@@ -886,7 +912,7 @@ static void dbs_check_cpu(struct cpu_dbs_info_s *this_dbs_info)
 
 		j_dbs_info = &per_cpu(od_cpu_dbs_info, j);
 
-		cur_idle_time = get_cpu_idle_time(j, &cur_wall_time, dbs_tuners_ins.io_is_busy);
+		cur_idle_time = get_cpu_idle_time(j, &cur_wall_time);
 		cur_iowait_time = get_cpu_iowait_time(j, &cur_wall_time);
 
 		wall_time = (unsigned int)
@@ -1220,7 +1246,7 @@ static void dbs_refresh_callback(struct work_struct *work)
 			policy->cur = target_freq;
 
 		this_dbs_info->prev_cpu_idle = get_cpu_idle_time(cpu,
-				&this_dbs_info->prev_cpu_wall, dbs_tuners_ins.io_is_busy);
+				&this_dbs_info->prev_cpu_wall);
 	}
 
 bail_incorrect_governor:
@@ -1238,16 +1264,7 @@ static int dbs_migration_notify(struct notifier_block *nb,
 		&per_cpu(od_cpu_dbs_info, target_cpu);
 
 	atomic_set(&target_dbs_info->src_sync_cpu, (int)arg);
-	/*
-	* Avoid issuing recursive wakeup call, as sync thread itself could be
-	* seen as migrating triggering this notification. Note that sync thread
-	* of a cpu could be running for a short while with its affinity broken
-	* because of CPU hotplug.
-	*/
-	if (!atomic_cmpxchg(&target_dbs_info->being_woken, 0, 1)) {
-		wake_up(&target_dbs_info->sync_wq);
-		atomic_set(&target_dbs_info->being_woken, 0);
-	}
+	wake_up(&target_dbs_info->sync_wq);
 
 	return NOTIFY_OK;
 }
@@ -1454,7 +1471,7 @@ static int cpufreq_governor_dbs(struct cpufreq_policy *policy,
 			j_dbs_info->cur_policy = policy;
 
 			j_dbs_info->prev_cpu_idle = get_cpu_idle_time(j,
-						&j_dbs_info->prev_cpu_wall, dbs_tuners_ins.io_is_busy);
+						&j_dbs_info->prev_cpu_wall);
 			if (dbs_tuners_ins.ignore_nice)
 				j_dbs_info->prev_cpu_nice =
 						kcpustat_cpu(j).cpustat[CPUTIME_NICE];
@@ -1613,7 +1630,7 @@ static int __init cpufreq_gov_dbs_init(void)
 		INIT_WORK(&dbs_work->work, dbs_refresh_callback);
 		dbs_work->cpu = i;
 
-		atomic_set(&this_dbs_info->being_woken, 0);
+		atomic_set(&this_dbs_info->src_sync_cpu, -1);
 		init_waitqueue_head(&this_dbs_info->sync_wq);
 
 		this_dbs_info->sync_thread = kthread_run(dbs_sync_thread,
