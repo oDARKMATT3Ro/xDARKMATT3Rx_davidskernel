@@ -1,2441 +1,6657 @@
-/*
- *  drivers/cpufreq/cpufreq_intellidemand.c
- *
- *  Copyright (C)  2001 Russell King
- *            (C)  2003 Venkatesh Pallipadi <venkatesh.pallipadi@intel.com>.
- *                      Jun Nakajima <jun.nakajima@intel.com>
- *            (C)  2013 The Linux Foundation. All rights reserved.
- *            (C)  2013 Paul Reioux
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 as
- * published by the Free Software Foundation.
- */
-
-#include <linux/kernel.h>
-#include <linux/module.h>
-#include <linux/init.h>
-#include <linux/cpufreq.h>
-#include <linux/cpu.h>
-#include <linux/jiffies.h>
-#include <linux/kernel_stat.h>
-#include <linux/mutex.h>
-#include <linux/hrtimer.h>
-#include <linux/tick.h>
-#include <linux/ktime.h>
-#include <linux/kthread.h>
-#include <linux/sched.h>
-#include <linux/input.h>
-#include <linux/workqueue.h>
-#include <linux/slab.h>
-
-#ifdef CONFIG_POWERSUSPEND
-#include <linux/powersuspend.h>
-#endif
-
-#define INTELLIDEMAND_MAJOR_VERSION    5
-#define INTELLIDEMAND_MINOR_VERSION    0
-
-/*
- * dbs is used in this file as a shortform for demandbased switching
- * It helps to keep variable names smaller, simpler
- */
-
-#define DEF_SAMPLING_RATE			(50000)
-#define DEF_FREQUENCY_DOWN_DIFFERENTIAL		(10)
-#define DEF_FREQUENCY_UP_THRESHOLD		(80)
-#define DEF_SAMPLING_DOWN_FACTOR		(1)
-#define MAX_SAMPLING_DOWN_FACTOR		(100000)
-#define MICRO_FREQUENCY_DOWN_DIFFERENTIAL	(3)
-#define MICRO_FREQUENCY_UP_THRESHOLD		(95)
-#define MICRO_FREQUENCY_MIN_SAMPLE_RATE		(10000)
-#define MIN_FREQUENCY_UP_THRESHOLD		(11)
-#define MAX_FREQUENCY_UP_THRESHOLD		(100)
-#define MIN_FREQUENCY_DOWN_DIFFERENTIAL		(1)
-#define DBS_INPUT_EVENT_MIN_FREQ		(1190400)
-#define DEF_UI_DYNAMIC_SAMPLING_RATE		(30000)
-#define DBS_UI_SAMPLING_MIN_TIMEOUT		(30)
-#define DBS_UI_SAMPLING_MAX_TIMEOUT		(1000)
-#define DBS_UI_SAMPLING_TIMEOUT			(80)
-
-#define DEF_FREQ_STEP				(25)
-#define DEF_STEP_UP_EARLY_HISPEED		(1190400)
-#define DEF_STEP_UP_INTERIM_HISPEED		(1728000)
-#define DEF_SAMPLING_EARLY_HISPEED_FACTOR	(2)
-#define DEF_SAMPLING_INTERIM_HISPEED_FACTOR	(3)
-
-/* PATCH : SMART_UP */
-#define MIN(X, Y) ((X) < (Y) ? (X) : (Y))
-
-#define SMART_UP_PLUS (0)
-#define SMART_UP_SLOW_UP_AT_HIGH_FREQ (1)
-#define SUP_MAX_STEP (3)
-#define SUP_CORE_NUM (4)
-#define SUP_SLOW_UP_DUR (5)
-#define SUP_SLOW_UP_DUR_DEFAULT (2)
-
-#define SUP_HIGH_SLOW_UP_DUR (5)
-#define SUP_FREQ_LEVEL (14)
-
-#ifdef CONFIG_POWERSUSPEND
-static unsigned long stored_sampling_rate;
-#endif
-
-#if defined(SMART_UP_PLUS)
-static unsigned int SUP_THRESHOLD_STEPS[SUP_MAX_STEP] = {75, 85, 90};
-static unsigned int SUP_FREQ_STEPS[SUP_MAX_STEP] = {4, 3, 2};
-//static unsigned int min_range = 108000;
-typedef struct{
-	unsigned int freq_idx;
-	unsigned int freq_value;
-} freq_table_idx;
-static freq_table_idx pre_freq_idx[SUP_CORE_NUM] = {};
-
-#endif
-
-
-#if defined(SMART_UP_SLOW_UP_AT_HIGH_FREQ)
-
-#define SUP_SLOW_UP_FREQUENCY 		(1574400)
-#define SUP_HIGH_SLOW_UP_FREQUENCY 	(1728000)
-#define SUP_SLOW_UP_LOAD 		(90)
-
-typedef struct {
-	unsigned int hist_max_load[SUP_SLOW_UP_DUR];
-	unsigned int hist_load_cnt;
-} history_load;
-static void reset_hist(history_load *hist_load);
-static history_load hist_load[SUP_CORE_NUM] = {};
-
-typedef struct {
-	unsigned int hist_max_load[SUP_HIGH_SLOW_UP_DUR];
-	unsigned int hist_load_cnt;
-} history_load_high;
-static void reset_hist_high(history_load_high *hist_load);
-static history_load_high hist_load_high[SUP_CORE_NUM] = {};
-
-#endif
-
-
-/*
- * The polling frequency of this governor depends on the capability of
- * the processor. Default polling frequency is 1000 times the transition
- * latency of the processor. The governor will work on any processor with
- * transition latency <= 10mS, using appropriate sampling
- * rate.
- * For CPUs with transition latency > 10mS (mostly drivers with CPUFREQ_ETERNAL)
- * this governor will not work.
- * All times here are in uS.
- */
-#define MIN_SAMPLING_RATE_RATIO			(2)
-
-static unsigned int min_sampling_rate;
-static unsigned int skip_intellidemand = 0;
-
-#define LATENCY_MULTIPLIER			(1000)
-#define MIN_LATENCY_MULTIPLIER			(20)
-#define TRANSITION_LATENCY_LIMIT		(10 * 1000 * 1000)
-
-#define POWERSAVE_BIAS_MAXLEVEL			(1000)
-#define POWERSAVE_BIAS_MINLEVEL			(-1000)
-
-static void do_dbs_timer(struct work_struct *work);
-static int cpufreq_governor_dbs(struct cpufreq_policy *policy,
-				unsigned int event);
-
-#ifndef CONFIG_CPU_FREQ_DEFAULT_GOV_INTELLIDEMAND
-static
-#endif
-struct cpufreq_governor cpufreq_gov_intellidemand = {
-       .name                   = "intellidemand",
-       .governor               = cpufreq_governor_dbs,
-       .max_transition_latency = TRANSITION_LATENCY_LIMIT,
-       .owner                  = THIS_MODULE,
-};
-
-/* Sampling types */
-enum {DBS_NORMAL_SAMPLE, DBS_SUB_SAMPLE};
-
-struct cpu_dbs_info_s {
-	cputime64_t prev_cpu_idle;
-	cputime64_t prev_cpu_iowait;
-	cputime64_t prev_cpu_wall;
-	cputime64_t prev_cpu_nice;
-	struct cpufreq_policy *cur_policy;
-	struct delayed_work work;
-	struct cpufreq_frequency_table *freq_table;
-	unsigned int freq_lo;
-	unsigned int freq_lo_jiffies;
-	unsigned int freq_hi_jiffies;
-	unsigned int rate_mult;
-	unsigned int prev_load;
-	unsigned int max_load;
-	int cpu;
-	unsigned int sample_type:1;
-	unsigned int freq_stay_count;
-	/*
-	 * percpu mutex that serializes governor limit change with
-	 * do_dbs_timer invocation. We do not want do_dbs_timer to run
-	 * when user is changing the governor or limits.
-	 */
-	struct mutex timer_mutex;
-
-	struct task_struct *sync_thread;
-	wait_queue_head_t sync_wq;
-	atomic_t src_sync_cpu;
-	atomic_t sync_enabled;
-};
-static DEFINE_PER_CPU(struct cpu_dbs_info_s, od_cpu_dbs_info);
-
-static inline void dbs_timer_init(struct cpu_dbs_info_s *dbs_info);
-static inline void dbs_timer_exit(struct cpu_dbs_info_s *dbs_info);
-
-static unsigned int dbs_enable;	/* number of CPUs using this policy */
-
-static DEFINE_PER_CPU(struct task_struct *, up_task);
-static spinlock_t input_boost_lock;
-static bool input_event_boost = false;
-static unsigned long ui_sampling_expired = 0;
-
-/*
- * dbs_mutex protects dbs_enable and dbs_info during start/stop.
- */
-static DEFINE_MUTEX(dbs_mutex);
-
-static struct workqueue_struct *dbs_wq;
-
-struct dbs_work_struct {
-	struct work_struct work;
-	unsigned int cpu;
-};
-
-static DEFINE_PER_CPU(struct dbs_work_struct, dbs_refresh_work);
-
-static struct dbs_tuners {
-	unsigned int sampling_rate;
-	unsigned int up_threshold;
-	unsigned int up_threshold_multi_core;
-	unsigned int down_differential;
-	unsigned int down_differential_multi_core;
-	unsigned int optimal_freq;
-	unsigned int up_threshold_any_cpu_load;
-	unsigned int sync_freq;
-	unsigned int ignore_nice;
-	unsigned int sampling_down_factor;
-	int          powersave_bias;
-	unsigned int io_is_busy;
-	//20130711 smart_up
-	unsigned int smart_up;
-	unsigned int smart_slow_up_load;
-	unsigned int smart_slow_up_freq;
-	unsigned int smart_slow_up_dur;
-	unsigned int smart_high_slow_up_freq;
-	unsigned int smart_high_slow_up_dur;
-	unsigned int smart_each_off;
-	// end smart_up
-	unsigned int freq_step;
-	unsigned int step_up_early_hispeed;
-	unsigned int step_up_interim_hispeed;
-	unsigned int sampling_early_factor;
-	unsigned int sampling_interim_factor;
-	unsigned int two_phase_freq;
-	unsigned int origin_sampling_rate;
-	unsigned int ui_sampling_rate;
-	unsigned int ui_timeout;
-	unsigned int enable_boost_cpu;
-
-} dbs_tuners_ins = {
-	.up_threshold_multi_core = DEF_FREQUENCY_UP_THRESHOLD,
-	.up_threshold = DEF_FREQUENCY_UP_THRESHOLD,
-	.sampling_down_factor = DEF_SAMPLING_DOWN_FACTOR,
-	.down_differential = DEF_FREQUENCY_DOWN_DIFFERENTIAL,
-	.down_differential_multi_core = MICRO_FREQUENCY_DOWN_DIFFERENTIAL,
-	.up_threshold_any_cpu_load = DEF_FREQUENCY_UP_THRESHOLD,
-	.ignore_nice = 0,
-	.powersave_bias = 0,
-	.sync_freq = 0,
-	.optimal_freq = 0,
-	//20130711 smart_up 
-	.smart_up = SMART_UP_PLUS,
-	.smart_slow_up_load = SUP_SLOW_UP_LOAD,
-	.smart_slow_up_freq = SUP_SLOW_UP_FREQUENCY,
-	.smart_slow_up_dur = SUP_SLOW_UP_DUR_DEFAULT,
-	.smart_high_slow_up_freq = SUP_HIGH_SLOW_UP_FREQUENCY,
-	.smart_high_slow_up_dur = SUP_HIGH_SLOW_UP_DUR,
-	.smart_each_off = 0,	
-	// end smart_up
-	.freq_step = DEF_FREQ_STEP,
-	.step_up_early_hispeed = DEF_STEP_UP_EARLY_HISPEED,
-	.step_up_interim_hispeed = DEF_STEP_UP_INTERIM_HISPEED,
-	.sampling_early_factor = DEF_SAMPLING_EARLY_HISPEED_FACTOR,
-	.sampling_interim_factor = DEF_SAMPLING_INTERIM_HISPEED_FACTOR,
-	.two_phase_freq = 0,
-	.ui_sampling_rate = DEF_UI_DYNAMIC_SAMPLING_RATE,
-	.ui_timeout = DBS_UI_SAMPLING_TIMEOUT,
-	.enable_boost_cpu = 1,
-
-};
-
-static inline u64 get_cpu_idle_time_jiffy(unsigned int cpu, u64 *wall)
-{
-	u64 idle_time;
-	u64 cur_wall_time;
-	u64 busy_time;
-
-	cur_wall_time = jiffies64_to_cputime64(get_jiffies_64());
-
-	busy_time  = kcpustat_cpu(cpu).cpustat[CPUTIME_USER];
-	busy_time += kcpustat_cpu(cpu).cpustat[CPUTIME_SYSTEM];
-	busy_time += kcpustat_cpu(cpu).cpustat[CPUTIME_IRQ];
-	busy_time += kcpustat_cpu(cpu).cpustat[CPUTIME_SOFTIRQ];
-	busy_time += kcpustat_cpu(cpu).cpustat[CPUTIME_STEAL];
-	busy_time += kcpustat_cpu(cpu).cpustat[CPUTIME_NICE];
-
-	idle_time = cur_wall_time - busy_time;
-	if (wall)
-		*wall = jiffies_to_usecs(cur_wall_time);
-
-	return jiffies_to_usecs(idle_time);
-}
-
-static inline cputime64_t get_cpu_idle_time(unsigned int cpu, cputime64_t *wall)
-{
-	u64 idle_time = get_cpu_idle_time_us(cpu, NULL);
-
-	if (idle_time == -1ULL)
-		return get_cpu_idle_time_jiffy(cpu, wall);
-	else
-		idle_time += get_cpu_iowait_time_us(cpu, wall);
-
-	return idle_time;
-}
-
-static inline cputime64_t get_cpu_iowait_time(unsigned int cpu, cputime64_t *wall)
-{
-	u64 iowait_time = get_cpu_iowait_time_us(cpu, wall);
-
-	if (iowait_time == -1ULL)
-		return 0;
-
-	return iowait_time;
-}
-
-/*
- * Find right freq to be set now with powersave_bias on.
- * Returns the freq_hi to be used right now and will set freq_hi_jiffies,
- * freq_lo, and freq_lo_jiffies in percpu area for averaging freqs.
- */
-static unsigned int powersave_bias_target(struct cpufreq_policy *policy,
-					  unsigned int freq_next,
-					  unsigned int relation)
-{
-	unsigned int freq_req, freq_avg;
-	unsigned int freq_hi, freq_lo;
-	unsigned int index = 0;
-	unsigned int jiffies_total, jiffies_hi, jiffies_lo;
-	int freq_reduc;
-	struct cpu_dbs_info_s *dbs_info = &per_cpu(od_cpu_dbs_info,
-						   policy->cpu);
-
-	if (!dbs_info->freq_table) {
-		dbs_info->freq_lo = 0;
-		dbs_info->freq_lo_jiffies = 0;
-		return freq_next;
-	}
-
-	cpufreq_frequency_table_target(policy, dbs_info->freq_table, freq_next,
-			relation, &index);
-	freq_req = dbs_info->freq_table[index].frequency;
-	freq_reduc = freq_req * dbs_tuners_ins.powersave_bias / 1000;
-	freq_avg = freq_req - freq_reduc;
-
-	/* Find freq bounds for freq_avg in freq_table */
-	index = 0;
-	cpufreq_frequency_table_target(policy, dbs_info->freq_table, freq_avg,
-			CPUFREQ_RELATION_H, &index);
-	freq_lo = dbs_info->freq_table[index].frequency;
-	index = 0;
-	cpufreq_frequency_table_target(policy, dbs_info->freq_table, freq_avg,
-			CPUFREQ_RELATION_L, &index);
-	freq_hi = dbs_info->freq_table[index].frequency;
-
-	/* Find out how long we have to be in hi and lo freqs */
-	if (freq_hi == freq_lo) {
-		dbs_info->freq_lo = 0;
-		dbs_info->freq_lo_jiffies = 0;
-		return freq_lo;
-	}
-	jiffies_total = usecs_to_jiffies(dbs_tuners_ins.sampling_rate);
-	jiffies_hi = (freq_avg - freq_lo) * jiffies_total;
-	jiffies_hi += ((freq_hi - freq_lo) / 2);
-	jiffies_hi /= (freq_hi - freq_lo);
-	jiffies_lo = jiffies_total - jiffies_hi;
-	dbs_info->freq_lo = freq_lo;
-	dbs_info->freq_lo_jiffies = jiffies_lo;
-	dbs_info->freq_hi_jiffies = jiffies_hi;
-	return freq_hi;
-}
-
-static int intellidemand_powersave_bias_setspeed(struct cpufreq_policy *policy,
-					    struct cpufreq_policy *altpolicy,
-					    int level)
-{
-	if (level == POWERSAVE_BIAS_MAXLEVEL) {
-		/* maximum powersave; set to lowest frequency */
-		__cpufreq_driver_target(policy,
-			(altpolicy) ? altpolicy->min : policy->min,
-			CPUFREQ_RELATION_L);
-		return 1;
-	} else if (level == POWERSAVE_BIAS_MINLEVEL) {
-		/* minimum powersave; set to highest frequency */
-		__cpufreq_driver_target(policy,
-			(altpolicy) ? altpolicy->max : policy->max,
-			CPUFREQ_RELATION_H);
-		return 1;
-	}
-	return 0;
-}
-
-static void intellidemand_powersave_bias_init_cpu(int cpu)
-{
-	struct cpu_dbs_info_s *dbs_info = &per_cpu(od_cpu_dbs_info, cpu);
-	dbs_info->freq_table = cpufreq_frequency_get_table(cpu);
-	dbs_info->freq_lo = 0;
-}
-
-static void intellidemand_powersave_bias_init(void)
-{
-	int i;
-	for_each_online_cpu(i) {
-		intellidemand_powersave_bias_init_cpu(i);
-	}
-}
-
-void intellidemand_boost_cpu(int boost)
-{
-	int cpu;
-
-	if (!dbs_tuners_ins.enable_boost_cpu)
-		return;
-
-	for_each_online_cpu(cpu) {
-		struct cpufreq_policy *policy;
-		struct cpu_dbs_info_s *dbs_info;
-
-		policy = cpufreq_cpu_get(cpu);
-		if (!policy)
-			continue;
-		dbs_info = &per_cpu(od_cpu_dbs_info, policy->cpu);
-		cpufreq_cpu_put(policy);
-
-		mutex_lock(&dbs_info->timer_mutex);
-		if (boost) {
-			skip_intellidemand = 1;
-			__cpufreq_driver_target(policy, policy->max, CPUFREQ_RELATION_H);
-		} else {
-			skip_intellidemand = 0;
-		}
-		mutex_unlock(&dbs_info->timer_mutex);
-	}
-}
-EXPORT_SYMBOL(intellidemand_boost_cpu);
-
-/************************** sysfs interface ************************/
-
-static ssize_t show_sampling_rate_min(struct kobject *kobj,
-				      struct attribute *attr, char *buf)
-{
-	return sprintf(buf, "%u\n", min_sampling_rate);
-}
-
-define_one_global_ro(sampling_rate_min);
-
-/* cpufreq_intellidemand Governor Tunables */
-#define show_one(file_name, object)					\
-static ssize_t show_##file_name						\
-(struct kobject *kobj, struct attribute *attr, char *buf)              \
-{									\
-	return sprintf(buf, "%u\n", dbs_tuners_ins.object);		\
-}
-show_one(sampling_rate, sampling_rate);
-show_one(io_is_busy, io_is_busy);
-show_one(up_threshold, up_threshold);
-show_one(up_threshold_multi_core, up_threshold_multi_core);
-show_one(down_differential, down_differential);
-show_one(sampling_down_factor, sampling_down_factor);
-show_one(ignore_nice_load, ignore_nice);
-show_one(optimal_freq, optimal_freq);
-show_one(up_threshold_any_cpu_load, up_threshold_any_cpu_load);
-show_one(sync_freq, sync_freq);
-//20130711 smart_up 
-show_one(smart_up, smart_up);
-show_one(smart_slow_up_load, smart_slow_up_load);
-show_one(smart_slow_up_freq, smart_slow_up_freq);
-show_one(smart_slow_up_dur, smart_slow_up_dur);
-show_one(smart_high_slow_up_freq, smart_high_slow_up_freq);
-show_one(smart_high_slow_up_dur, smart_high_slow_up_dur);
-show_one(smart_each_off, smart_each_off);
-// end smart_up
-show_one(freq_step, freq_step);
-show_one(step_up_early_hispeed, step_up_early_hispeed);
-show_one(step_up_interim_hispeed, step_up_interim_hispeed);
-show_one(sampling_early_factor, sampling_early_factor);
-show_one(sampling_interim_factor, sampling_interim_factor);
-show_one(enable_boost_cpu, enable_boost_cpu)
-
-static ssize_t show_powersave_bias
-(struct kobject *kobj, struct attribute *attr, char *buf)
-{
-	return snprintf(buf, PAGE_SIZE, "%d\n", dbs_tuners_ins.powersave_bias);
-}
-
-/**
- * update_sampling_rate - update sampling rate effective immediately if needed.
- * @new_rate: new sampling rate
- *
- * If new rate is smaller than the old, simply updaing
- * dbs_tuners_int.sampling_rate might not be appropriate. For example,
- * if the original sampling_rate was 1 second and the requested new sampling
- * rate is 10 ms because the user needs immediate reaction from intellidemand
- * governor, but not sure if higher frequency will be required or not,
- * then, the governor may change the sampling rate too late; up to 1 second
- * later. Thus, if we are reducing the sampling rate, we need to make the
- * new value effective immediately.
- */
-static void update_sampling_rate(unsigned int new_rate)
-{
-	int cpu;
-
-	dbs_tuners_ins.sampling_rate = new_rate
-				     = max(new_rate, min_sampling_rate);
-
-	get_online_cpus();
-	for_each_online_cpu(cpu) {
-		struct cpufreq_policy *policy;
-		struct cpu_dbs_info_s *dbs_info;
-		unsigned long next_sampling, appointed_at;
-
-		policy = cpufreq_cpu_get(cpu);
-		if (!policy)
-			continue;
-		dbs_info = &per_cpu(od_cpu_dbs_info, policy->cpu);
-		cpufreq_cpu_put(policy);
-
-		mutex_lock(&dbs_info->timer_mutex);
-
-		if (!delayed_work_pending(&dbs_info->work)) {
-			mutex_unlock(&dbs_info->timer_mutex);
-			continue;
-		}
-
-		next_sampling  = jiffies + usecs_to_jiffies(new_rate);
-		appointed_at = dbs_info->work.timer.expires;
-
-
-		if (time_before(next_sampling, appointed_at)) {
-
-			mutex_unlock(&dbs_info->timer_mutex);
-			cancel_delayed_work_sync(&dbs_info->work);
-			mutex_lock(&dbs_info->timer_mutex);
-
-			queue_delayed_work_on(dbs_info->cpu, dbs_wq,
-				&dbs_info->work, usecs_to_jiffies(new_rate));
-
-		}
-		mutex_unlock(&dbs_info->timer_mutex);
-	}
-	put_online_cpus();
-}
-
-show_one(ui_timeout, ui_timeout);
-
-static ssize_t store_ui_timeout(struct kobject *a, struct attribute *b,
-				      const char *buf, size_t count)
-{
-	unsigned int input;
-	int ret;
-	ret = sscanf(buf, "%u", &input);
-	if (ret != 1)
-		return -EINVAL;
-
-	input = max(input, (unsigned int)DBS_UI_SAMPLING_MIN_TIMEOUT);
-	dbs_tuners_ins.ui_timeout = min(input, (unsigned int)DBS_UI_SAMPLING_MAX_TIMEOUT);
-
-	return count;
-}
-
-static int two_phase_freq_array[NR_CPUS] = {[0 ... NR_CPUS-1] = 0} ;
-
-static ssize_t show_two_phase_freq
-(struct kobject *kobj, struct attribute *attr, char *buf)
-{
-	int i = 0 ;
-	int shift = 0 ;
-	char *buf_pos = buf;
-	for ( i = 0 ; i < NR_CPUS; i++) {
-		shift = sprintf(buf_pos,"%d,",two_phase_freq_array[i]);
-		buf_pos += shift;
-	}
-	*(buf_pos-1) = '\0';
-	return strlen(buf);
-}
-
-static ssize_t store_two_phase_freq(struct kobject *a, struct attribute *b,
-		const char *buf, size_t count)
-{
-
-	int ret = 0;
-	if (NR_CPUS == 1)
-		ret = sscanf(buf,"%u",&two_phase_freq_array[0]);
-	else if (NR_CPUS == 2)
-		ret = sscanf(buf,"%u,%u",&two_phase_freq_array[0],
-				&two_phase_freq_array[1]);
-	else if (NR_CPUS == 4)
-		ret = sscanf(buf, "%u,%u,%u,%u", &two_phase_freq_array[0],
-				&two_phase_freq_array[1],
-				&two_phase_freq_array[2],
-				&two_phase_freq_array[3]);
-	if (ret < NR_CPUS)
-		return -EINVAL;
-
-	return count;
-}
-
-static int input_event_min_freq_array[NR_CPUS] = {[0 ... NR_CPUS-1] = DBS_INPUT_EVENT_MIN_FREQ} ;
-
-static ssize_t show_input_event_min_freq
-(struct kobject *kobj, struct attribute *attr, char *buf)
-{
-	int i = 0 ;
-	int shift = 0 ;
-	char *buf_pos = buf;
-	for ( i = 0 ; i < NR_CPUS; i++) {
-		shift = sprintf(buf_pos,"%d,",input_event_min_freq_array[i]);
-		buf_pos += shift;
-	}
-	*(buf_pos-1) = '\0';
-	return strlen(buf);
-}
-
-static ssize_t store_input_event_min_freq(struct kobject *a, struct attribute *b,
-		const char *buf, size_t count)
-{
-
-	int ret = 0;
-	if (NR_CPUS == 1)
-		ret = sscanf(buf,"%u",&input_event_min_freq_array[0]);
-	else if (NR_CPUS == 2)
-		ret = sscanf(buf,"%u,%u",&input_event_min_freq_array[0],
-				&input_event_min_freq_array[1]);
-	else if (NR_CPUS == 4)
-		ret = sscanf(buf, "%u,%u,%u,%u", &input_event_min_freq_array[0],
-				&input_event_min_freq_array[1],
-				&input_event_min_freq_array[2],
-				&input_event_min_freq_array[3]);
-	if (ret < NR_CPUS)
-		return -EINVAL;
-
-	return count;
-}
-
-show_one(ui_sampling_rate, ui_sampling_rate);
-
-static ssize_t store_sampling_rate(struct kobject *a, struct attribute *b,
-				   const char *buf, size_t count)
-{
-	unsigned int input;
-	int ret;
-	ret = sscanf(buf, "%u", &input);
-	if (ret != 1)
-		return -EINVAL;
-	if (input == dbs_tuners_ins.origin_sampling_rate)
-		return count;
-	update_sampling_rate(input);
-	dbs_tuners_ins.origin_sampling_rate = dbs_tuners_ins.sampling_rate;
-	return count;
-}
-
-static ssize_t store_ui_sampling_rate(struct kobject *a, struct attribute *b,
-				      const char *buf, size_t count)
-{
-	unsigned int input;
-	int ret;
-	ret = sscanf(buf, "%u", &input);
-	if (ret != 1)
-		return -EINVAL;
-
-	dbs_tuners_ins.ui_sampling_rate = max(input, min_sampling_rate);
-
-	return count;
-}
-
-static ssize_t store_sync_freq(struct kobject *a, struct attribute *b,
-				   const char *buf, size_t count)
-{
-	unsigned int input;
-	int ret;
-
-	ret = sscanf(buf, "%u", &input);
-	if (ret != 1)
-		return -EINVAL;
-	dbs_tuners_ins.sync_freq = input;
-	return count;
-}
-
-static ssize_t store_io_is_busy(struct kobject *a, struct attribute *b,
-				   const char *buf, size_t count)
-{
-	unsigned int input;
-	int ret;
-
-	ret = sscanf(buf, "%u", &input);
-	if (ret != 1)
-		return -EINVAL;
-	dbs_tuners_ins.io_is_busy = !!input;
-	return count;
-}
-
-static ssize_t store_optimal_freq(struct kobject *a, struct attribute *b,
-				   const char *buf, size_t count)
-{
-	unsigned int input;
-	int ret;
-
-	ret = sscanf(buf, "%u", &input);
-	if (ret != 1)
-		return -EINVAL;
-	dbs_tuners_ins.optimal_freq = input;
-	return count;
-}
-
-static ssize_t store_up_threshold(struct kobject *a, struct attribute *b,
-				  const char *buf, size_t count)
-{
-	unsigned int input;
-	int ret;
-	ret = sscanf(buf, "%u", &input);
-
-	if (ret != 1 || input > MAX_FREQUENCY_UP_THRESHOLD ||
-			input < MIN_FREQUENCY_UP_THRESHOLD) {
-		return -EINVAL;
-	}
-	dbs_tuners_ins.up_threshold = input;
-	return count;
-}
-
-static ssize_t store_up_threshold_multi_core(struct kobject *a,
-			struct attribute *b, const char *buf, size_t count)
-{
-	unsigned int input;
-	int ret;
-	ret = sscanf(buf, "%u", &input);
-
-	if (ret != 1 || input > MAX_FREQUENCY_UP_THRESHOLD ||
-			input < MIN_FREQUENCY_UP_THRESHOLD) {
-		return -EINVAL;
-	}
-	dbs_tuners_ins.up_threshold_multi_core = input;
-	return count;
-}
-
-static ssize_t store_up_threshold_any_cpu_load(struct kobject *a,
-			struct attribute *b, const char *buf, size_t count)
-{
-	unsigned int input;
-	int ret;
-	ret = sscanf(buf, "%u", &input);
-
-	if (ret != 1 || input > MAX_FREQUENCY_UP_THRESHOLD ||
-			input < MIN_FREQUENCY_UP_THRESHOLD) {
-		return -EINVAL;
-	}
-	dbs_tuners_ins.up_threshold_any_cpu_load = input;
-	return count;
-}
-
-static ssize_t store_down_differential(struct kobject *a, struct attribute *b,
-		const char *buf, size_t count)
-{
-	unsigned int input;
-	int ret;
-	ret = sscanf(buf, "%u", &input);
-
-	if (ret != 1 || input >= dbs_tuners_ins.up_threshold ||
-			input < MIN_FREQUENCY_DOWN_DIFFERENTIAL) {
-		return -EINVAL;
-	}
-
-	dbs_tuners_ins.down_differential = input;
-
-	return count;
-}
-
-static ssize_t store_sampling_down_factor(struct kobject *a,
-			struct attribute *b, const char *buf, size_t count)
-{
-	unsigned int input, j;
-	int ret;
-	ret = sscanf(buf, "%u", &input);
-
-	if (ret != 1 || input > MAX_SAMPLING_DOWN_FACTOR || input < 1)
-		return -EINVAL;
-	dbs_tuners_ins.sampling_down_factor = input;
-
-	/* Reset down sampling multiplier in case it was active */
-	for_each_online_cpu(j) {
-		struct cpu_dbs_info_s *dbs_info;
-		dbs_info = &per_cpu(od_cpu_dbs_info, j);
-		dbs_info->rate_mult = 1;
-	}
-	return count;
-}
-
-static ssize_t store_ignore_nice_load(struct kobject *a, struct attribute *b,
-				      const char *buf, size_t count)
-{
-	unsigned int input;
-	int ret;
-
-	unsigned int j;
-
-	ret = sscanf(buf, "%u", &input);
-	if (ret != 1)
-		return -EINVAL;
-
-	if (input > 1)
-		input = 1;
-
-	if (input == dbs_tuners_ins.ignore_nice) { /* nothing to do */
-		return count;
-	}
-	dbs_tuners_ins.ignore_nice = input;
-
-	/* we need to re-evaluate prev_cpu_idle */
-	for_each_online_cpu(j) {
-		struct cpu_dbs_info_s *dbs_info;
-		dbs_info = &per_cpu(od_cpu_dbs_info, j);
-		dbs_info->prev_cpu_idle = get_cpu_idle_time(j,
-						&dbs_info->prev_cpu_wall);
-		if (dbs_tuners_ins.ignore_nice)
-			dbs_info->prev_cpu_nice = kcpustat_cpu(j).cpustat[CPUTIME_NICE];
-
-	}
-	return count;
-}
-
-static ssize_t store_powersave_bias(struct kobject *a, struct attribute *b,
-				    const char *buf, size_t count)
-{
-	int input  = 0;
-	int bypass = 0;
-	int ret, cpu, reenable_timer, j;
-	struct cpu_dbs_info_s *dbs_info;
-
-	struct cpumask cpus_timer_done;
-	cpumask_clear(&cpus_timer_done);
-
-	ret = sscanf(buf, "%d", &input);
-
-	if (ret != 1)
-		return -EINVAL;
-
-	if (input >= POWERSAVE_BIAS_MAXLEVEL) {
-		input  = POWERSAVE_BIAS_MAXLEVEL;
-		bypass = 1;
-	} else if (input <= POWERSAVE_BIAS_MINLEVEL) {
-		input  = POWERSAVE_BIAS_MINLEVEL;
-		bypass = 1;
-	}
-
-	if (input == dbs_tuners_ins.powersave_bias) {
-		/* no change */
-		return count;
-	}
-
-	reenable_timer = ((dbs_tuners_ins.powersave_bias ==
-				POWERSAVE_BIAS_MAXLEVEL) ||
-				(dbs_tuners_ins.powersave_bias ==
-				POWERSAVE_BIAS_MINLEVEL));
-
-	dbs_tuners_ins.powersave_bias = input;
-
-	get_online_cpus();
-	mutex_lock(&dbs_mutex);
-
-	if (!bypass) {
-		if (reenable_timer) {
-			/* reinstate dbs timer */
-			for_each_online_cpu(cpu) {
-				if (lock_policy_rwsem_write(cpu) < 0)
-					continue;
-
-				dbs_info = &per_cpu(od_cpu_dbs_info, cpu);
-
-				for_each_cpu(j, &cpus_timer_done) {
-					if (!dbs_info->cur_policy) {
-						pr_err("Dbs policy is NULL\n");
-						goto skip_this_cpu;
-					}
-					if (cpumask_test_cpu(j, dbs_info->
-							cur_policy->cpus))
-						goto skip_this_cpu;
-				}
-
-				cpumask_set_cpu(cpu, &cpus_timer_done);
-				if (dbs_info->cur_policy) {
-					/* restart dbs timer */
-					dbs_timer_init(dbs_info);
-					/* Enable frequency synchronization
-					 * of CPUs */
-					atomic_set(&dbs_info->sync_enabled, 1);
-				}
-skip_this_cpu:
-				unlock_policy_rwsem_write(cpu);
-			}
-		}
-		intellidemand_powersave_bias_init();
-	} else {
-		/* running at maximum or minimum frequencies; cancel
-		   dbs timer as periodic load sampling is not necessary */
-		for_each_online_cpu(cpu) {
-			if (lock_policy_rwsem_write(cpu) < 0)
-				continue;
-
-			dbs_info = &per_cpu(od_cpu_dbs_info, cpu);
-
-			for_each_cpu(j, &cpus_timer_done) {
-				if (!dbs_info->cur_policy) {
-					pr_err("Dbs policy is NULL\n");
-					goto skip_this_cpu_bypass;
-				}
-				if (cpumask_test_cpu(j, dbs_info->
-							cur_policy->cpus))
-					goto skip_this_cpu_bypass;
-			}
-
-			cpumask_set_cpu(cpu, &cpus_timer_done);
-
-			if (dbs_info->cur_policy) {
-				/* cpu using intellidemand, cancel dbs timer */
-				dbs_timer_exit(dbs_info);
-				/* Disable frequency synchronization of
-				 * CPUs to avoid re-queueing of work from
-				 * sync_thread */
-				atomic_set(&dbs_info->sync_enabled, 0);
-
-				mutex_lock(&dbs_info->timer_mutex);
-				intellidemand_powersave_bias_setspeed(
-					dbs_info->cur_policy,
-					NULL,
-					input);
-				mutex_unlock(&dbs_info->timer_mutex);
-
-			}
-skip_this_cpu_bypass:
-			unlock_policy_rwsem_write(cpu);
-		}
-	}
-
-	mutex_unlock(&dbs_mutex);
-	put_online_cpus();
-
-	return count;
-}
-
-static ssize_t store_enable_boost_cpu(struct kobject *a, struct attribute *b,
-				const char *buf, size_t count)
-{
-	unsigned int input;
-	int ret;
-
-	ret = sscanf(buf, "%u", &input);
-	if(ret != 1)
-		return -EINVAL;
-
-	dbs_tuners_ins.enable_boost_cpu = (input > 0 ? input : 0);
-	return count;
-}
-
-/* PATCH : SMART_UP */
-#if defined(SMART_UP_SLOW_UP_AT_HIGH_FREQ)
-static void reset_hist(history_load *hist_load)
-{	int i;
-
-	for (i = 0; i < SUP_SLOW_UP_DUR ; i++)
-		hist_load->hist_max_load[i] = 0;
-
-	hist_load->hist_load_cnt = 0;
-}
-
-
-static void reset_hist_high(history_load_high *hist_load)
-{	int i;
-
-	for (i = 0; i < SUP_HIGH_SLOW_UP_DUR ; i++)
-		hist_load->hist_max_load[i] = 0;
-
-	hist_load->hist_load_cnt = 0;
-}
-
-#endif
-
-//20130711 smart_up
-static ssize_t store_smart_up(struct kobject *a, struct attribute *b,
-				   const char *buf, size_t count)
-{
-	unsigned int input;
-	int ret;
-	unsigned int i;
-
-	ret = sscanf(buf, "%u", &input);
-	if (ret != 1)
-		return -EINVAL;
-	if (input > 1 ){
-		input = 1;
-	}else if (input < 0 ){
-		input = 0;
-	}
-	
-	// buffer reset
-	for_each_online_cpu(i){
-		reset_hist(&hist_load[i]);
-		reset_hist_high(&hist_load_high[i]);
-	}
-	dbs_tuners_ins.smart_up = input;
-	return count;
-}
-
-static ssize_t store_smart_slow_up_load(struct kobject *a, struct attribute *b,
-				   const char *buf, size_t count)
-{
-	unsigned int input;
-	int ret;
-	unsigned int i;
-
-	ret = sscanf(buf, "%u", &input);
-	if (ret != 1)
-		return -EINVAL;
-	if (input > 100 ){
-		input = 100;
-	}else if (input < 0){
-		input = 0;
-	}
-	// buffer reset
-	for_each_online_cpu(i){
-		reset_hist(&hist_load[i]);
-		reset_hist_high(&hist_load_high[i]);
-	}
-	dbs_tuners_ins.smart_slow_up_load = input;
-	return count;
-}
-static ssize_t store_smart_slow_up_freq(struct kobject *a, struct attribute *b,
-				   const char *buf, size_t count)
-{
-	unsigned int input;
-	int ret;
-	unsigned int i;
-
-	ret = sscanf(buf, "%u", &input);
-	if (ret != 1)
-		return -EINVAL;
-	if (input < 0)
-		input = 0;
-	// buffer reset
-	for_each_online_cpu(i){
-		reset_hist(&hist_load[i]);
-		reset_hist_high(&hist_load_high[i]);
-	}
-	dbs_tuners_ins.smart_slow_up_freq = input;
-	return count;
-}
-static ssize_t store_smart_slow_up_dur(struct kobject *a, struct attribute *b,
-				   const char *buf, size_t count)
-{
-	unsigned int input;
-	int ret;
-	unsigned int i;
-
-	ret = sscanf(buf, "%u", &input);
-	if (ret != 1)
-		return -EINVAL;
-	if (input > SUP_SLOW_UP_DUR ){
-		input = SUP_SLOW_UP_DUR;
-	}else if (input < 1 ){
-		input = 1;
-	}
-	// buffer reset
-	for_each_online_cpu(i){
-		reset_hist(&hist_load[i]);
-		reset_hist_high(&hist_load_high[i]);
-	}
-	dbs_tuners_ins.smart_slow_up_dur = input;
-	return count;
-}
-static ssize_t store_smart_high_slow_up_freq(struct kobject *a, struct attribute *b,
-				   const char *buf, size_t count)
-{
-	unsigned int input;
-	int ret;
-	unsigned int i;
-
-	ret = sscanf(buf, "%u", &input);
-	if (ret != 1)
-		return -EINVAL;
-	if (input < 0)
-		input = 0;
-	// buffer reset
-	for_each_online_cpu(i){
-		reset_hist(&hist_load[i]);
-		reset_hist_high(&hist_load_high[i]);
-	}
-	dbs_tuners_ins.smart_high_slow_up_freq = input;
-	return count;
-}
-static ssize_t store_smart_high_slow_up_dur(struct kobject *a, struct attribute *b,
-				   const char *buf, size_t count)
-{
-	unsigned int input;
-	int ret;
-	unsigned int i;
-
-	ret = sscanf(buf, "%u", &input);
-	if (ret != 1)
-		return -EINVAL;
-	if (input > SUP_HIGH_SLOW_UP_DUR ){
-		input = SUP_HIGH_SLOW_UP_DUR;
-	}else if (input < 1 ){
-		input = 1;
-	}
-	// buffer reset
-	for_each_online_cpu(i){
-		reset_hist(&hist_load[i]);
-		reset_hist_high(&hist_load_high[i]);
-	}
-	dbs_tuners_ins.smart_high_slow_up_dur = input;
-	return count;
-}
-static ssize_t store_smart_each_off(struct kobject *a, struct attribute *b,
-				   const char *buf, size_t count)
-{
-	unsigned int input;
-	int ret;
-	unsigned int i;
-
-	ret = sscanf(buf, "%u", &input);
-	if (ret != 1)
-		return -EINVAL;
-	if (input >  SUP_CORE_NUM){
-		input = SUP_CORE_NUM;
-	}else if ( input < 0){
-		input = 0;
-	}
-	// buffer reset
-	for_each_online_cpu(i){
-		reset_hist(&hist_load[i]);
-		reset_hist_high(&hist_load_high[i]);
-	}
-	dbs_tuners_ins.smart_each_off = input;
-
-	return count;
-}
-//end  smart_up
-
-static ssize_t store_freq_step(struct kobject *a,
-			struct attribute *b, const char *buf, size_t count)
-{
-	unsigned int input;
-	int ret;
-	ret = sscanf(buf, "%u", &input);
-
-	if (ret != 1 || input > 100 ||
-			input < 0) {
-		return -EINVAL;
-	}
-	dbs_tuners_ins.freq_step = input;
-	return count;
-}
-
-static ssize_t store_step_up_early_hispeed(struct kobject *a,
-			struct attribute *b, const char *buf, size_t count)
-{
-	unsigned int input;
-	int ret;
-	ret = sscanf(buf, "%u", &input);
-
-	if (ret != 1 || input > 2265600 ||
-			input < 0) {
-		return -EINVAL;
-	}
-	dbs_tuners_ins.step_up_early_hispeed = input;
-	return count;
-}
-
-static ssize_t store_step_up_interim_hispeed(struct kobject *a,
-			struct attribute *b, const char *buf, size_t count)
-{
-	unsigned int input;
-	int ret;
-	ret = sscanf(buf, "%u", &input);
-
-	if (ret != 1 || input > 2265600 ||
-			input < 0) {
-		return -EINVAL;
-	}
-	dbs_tuners_ins.step_up_interim_hispeed = input;
-	return count;
-}
-
-static ssize_t store_sampling_early_factor(struct kobject *a,
-			struct attribute *b, const char *buf, size_t count)
-{
-	unsigned int input;
-	int ret;
-	ret = sscanf(buf, "%u", &input);
-
-	if (ret != 1 || input < 1)
-		return -EINVAL;
-	dbs_tuners_ins.sampling_early_factor = input;
-	return count;
-}
-
-static ssize_t store_sampling_interim_factor(struct kobject *a,
-			struct attribute *b, const char *buf, size_t count)
-{
-	unsigned int input;
-	int ret;
-	ret = sscanf(buf, "%u", &input);
-
-	if (ret != 1 || input < 1)
-		return -EINVAL;
-	dbs_tuners_ins.sampling_interim_factor = input;
-	return count;
-}
-
-define_one_global_rw(sampling_rate);
-define_one_global_rw(io_is_busy);
-define_one_global_rw(up_threshold);
-define_one_global_rw(down_differential);
-define_one_global_rw(sampling_down_factor);
-define_one_global_rw(ignore_nice_load);
-define_one_global_rw(powersave_bias);
-define_one_global_rw(up_threshold_multi_core);
-define_one_global_rw(optimal_freq);
-define_one_global_rw(up_threshold_any_cpu_load);
-define_one_global_rw(sync_freq);
-//20130711 smart_up
-define_one_global_rw(smart_up);
-define_one_global_rw(smart_slow_up_load);
-define_one_global_rw(smart_slow_up_freq);
-define_one_global_rw(smart_slow_up_dur);
-define_one_global_rw(smart_high_slow_up_freq);
-define_one_global_rw(smart_high_slow_up_dur);
-define_one_global_rw(smart_each_off);
-// end smart_up
-define_one_global_rw(freq_step);
-define_one_global_rw(step_up_early_hispeed);
-define_one_global_rw(step_up_interim_hispeed);
-define_one_global_rw(sampling_early_factor);
-define_one_global_rw(sampling_interim_factor);
-define_one_global_rw(two_phase_freq);
-define_one_global_rw(input_event_min_freq);
-define_one_global_rw(ui_sampling_rate);
-define_one_global_rw(ui_timeout);
-define_one_global_rw(enable_boost_cpu);
-
-static struct attribute *dbs_attributes[] = {
-	&sampling_rate_min.attr,
-	&sampling_rate.attr,
-	&up_threshold.attr,
-	&down_differential.attr,
-	&sampling_down_factor.attr,
-	&ignore_nice_load.attr,
-	&powersave_bias.attr,
-	&io_is_busy.attr,
-	&up_threshold_multi_core.attr,
-	&optimal_freq.attr,
-	&up_threshold_any_cpu_load.attr,
-	&sync_freq.attr,
-	//20130711 smart_up
-	&smart_up.attr,
-	&smart_slow_up_load.attr,
-	&smart_slow_up_freq.attr,
-	&smart_slow_up_dur.attr,
-	&smart_high_slow_up_freq.attr,
-	&smart_high_slow_up_dur.attr,
-	&smart_each_off.attr,
-	// end smart_up
-	&freq_step.attr,
-	&step_up_early_hispeed.attr,
-	&step_up_interim_hispeed.attr,
-	&sampling_early_factor.attr,
-	&sampling_interim_factor.attr,
-	&two_phase_freq.attr,
-	&input_event_min_freq.attr,
-	&ui_sampling_rate.attr,
-	&ui_timeout.attr,
-	&enable_boost_cpu.attr,
-
-	NULL
-};
-
-static struct attribute_group dbs_attr_group = {
-	.attrs = dbs_attributes,
-	.name = "intellidemand",
-};
-
-/************************** sysfs end ************************/
-
-static void dbs_freq_increase(struct cpufreq_policy *p, unsigned int freq)
-{
-	if (dbs_tuners_ins.powersave_bias)
-		freq = powersave_bias_target(p, freq, CPUFREQ_RELATION_H);
-	else if (p->cur == p->max)
-		return;
-
-	__cpufreq_driver_target(p, freq, dbs_tuners_ins.powersave_bias ?
-			CPUFREQ_RELATION_L : CPUFREQ_RELATION_H);
-}
-
-int set_two_phase_freq(int cpufreq)
-{
-	int i  = 0;
-	for ( i = 0 ; i < NR_CPUS; i++)
-		two_phase_freq_array[i] = cpufreq;
-	return 0;
-}
-
-void set_two_phase_freq_by_cpu ( int cpu_nr, int cpufreq){
-	two_phase_freq_array[cpu_nr-1] = cpufreq;
-}
-
-int input_event_boosted(void)
-{
-	unsigned long flags;
-
-	
-	spin_lock_irqsave(&input_boost_lock, flags);
-	if (input_event_boost) {
-		if (time_before(jiffies, ui_sampling_expired)) {
-			spin_unlock_irqrestore(&input_boost_lock, flags);
-			return 1;
-		}
-		input_event_boost = false;
-		dbs_tuners_ins.sampling_rate = dbs_tuners_ins.origin_sampling_rate;
-	}
-	spin_unlock_irqrestore(&input_boost_lock, flags);
-
-	return 0;
-}
-
-static void dbs_check_cpu(struct cpu_dbs_info_s *this_dbs_info)
-{
-
-#if defined(SMART_UP_PLUS)
-	unsigned int max_load = 0;
-	unsigned int core_j = 0;
-#endif
-
-	/* Extrapolated load of this CPU */
-	unsigned int load_at_max_freq = 0;
-	unsigned int max_load_freq;
-	/* Current load across this CPU */
-	unsigned int cur_load = 0;
-	unsigned int max_load_other_cpu = 0;
-	struct cpufreq_policy *policy;
-	unsigned int j;
-	static unsigned int phase = 0;
-	static unsigned int counter = 0;
-	unsigned int nr_cpus;
-
-	this_dbs_info->freq_lo = 0;
-	policy = this_dbs_info->cur_policy;
-
-	/*
-	 * Every sampling_rate, we check, if current idle time is less
-	 * than 20% (default), then we try to increase frequency
-	 * Every sampling_rate, we look for a the lowest
-	 * frequency which can sustain the load while keeping idle time over
-	 * 30%. If such a frequency exist, we try to decrease to this frequency.
-	 *
-	 * Any frequency increase takes it to the maximum frequency.
-	 * Frequency reduction happens at minimum steps of
-	 * 5% (default) of current frequency
-	 */
-
-	/* Get Absolute Load - in terms of freq */
-	max_load_freq = 0;
-
-	for_each_cpu(j, policy->cpus) {
-		struct cpu_dbs_info_s *j_dbs_info;
-		cputime64_t cur_wall_time, cur_idle_time, cur_iowait_time;
-		unsigned int idle_time, wall_time, iowait_time;
-		unsigned int load_freq;
-		int freq_avg;
-
-		j_dbs_info = &per_cpu(od_cpu_dbs_info, j);
-
-		cur_idle_time = get_cpu_idle_time(j, &cur_wall_time);
-		cur_iowait_time = get_cpu_iowait_time(j, &cur_wall_time);
-
-		wall_time = (unsigned int)
-			(cur_wall_time - j_dbs_info->prev_cpu_wall);
-		j_dbs_info->prev_cpu_wall = cur_wall_time;
-
-		idle_time = (unsigned int)
-			(cur_idle_time - j_dbs_info->prev_cpu_idle);
-		j_dbs_info->prev_cpu_idle = cur_idle_time;
-
-		iowait_time = (unsigned int)
-			(cur_iowait_time - j_dbs_info->prev_cpu_iowait);
-		j_dbs_info->prev_cpu_iowait = cur_iowait_time;
-
-		if (dbs_tuners_ins.ignore_nice) {
-			u64 cur_nice;
-			unsigned long cur_nice_jiffies;
-
-			cur_nice = kcpustat_cpu(j).cpustat[CPUTIME_NICE] -
-					 j_dbs_info->prev_cpu_nice;
-			/*
-			 * Assumption: nice time between sampling periods will
-			 * be less than 2^32 jiffies for 32 bit sys
-			 */
-			cur_nice_jiffies = (unsigned long)
-					cputime64_to_jiffies64(cur_nice);
-
-			j_dbs_info->prev_cpu_nice = kcpustat_cpu(j).cpustat[CPUTIME_NICE];
-			idle_time += jiffies_to_usecs(cur_nice_jiffies);
-		}
-
-		/*
-		 * For the purpose of intellidemand, waiting for disk IO is an
-		 * indication that you're performance critical, and not that
-		 * the system is actually idle. So subtract the iowait time
-		 * from the cpu idle time.
-		 */
-
-		if (dbs_tuners_ins.io_is_busy && idle_time >= iowait_time)
-			idle_time -= iowait_time;
-
-		if (unlikely(!wall_time || wall_time < idle_time))
-			continue;
-
-		cur_load = 100 * (wall_time - idle_time) / wall_time;
-		j_dbs_info->max_load  = max(cur_load, j_dbs_info->prev_load);
-		j_dbs_info->prev_load = cur_load;
-		freq_avg = __cpufreq_driver_getavg(policy, j);
-		if (freq_avg <= 0)
-			freq_avg = policy->cur;
-
-		load_freq = cur_load * freq_avg;
-		if (load_freq > max_load_freq)
-			max_load_freq = load_freq;
-
-#if defined(SMART_UP_PLUS)
-		max_load = cur_load;
-		core_j = j;
-#endif
-
-	}
-
-	for_each_online_cpu(j) {
-		struct cpu_dbs_info_s *j_dbs_info;
-		j_dbs_info = &per_cpu(od_cpu_dbs_info, j);
-
-		if (j == policy->cpu)
-			continue;
-
-		if (max_load_other_cpu < j_dbs_info->max_load)
-			max_load_other_cpu = j_dbs_info->max_load;
-		/*
-		 * The other cpu could be running at higher frequency
-		 * but may not have completed it's sampling_down_factor.
-		 * For that case consider other cpu is loaded so that
-		 * frequency imbalance does not occur.
-		 */
-
-		if ((j_dbs_info->cur_policy != NULL)
-			&& (j_dbs_info->cur_policy->cur ==
-					j_dbs_info->cur_policy->max)) {
-
-			if (policy->cur >= dbs_tuners_ins.optimal_freq)
-				max_load_other_cpu =
-				dbs_tuners_ins.up_threshold_any_cpu_load;
-		}
-	}
-
-	/* calculate the scaled load across CPU */
-	load_at_max_freq = (cur_load * policy->cur)/policy->cpuinfo.max_freq;
-
-	cpufreq_notify_utilization(policy, load_at_max_freq);
-
-/* PATCH : SMART_UP */
-	if (dbs_tuners_ins.smart_up && ( core_j + 1 ) > dbs_tuners_ins.smart_each_off ){
-
-	if (max_load_freq > SUP_THRESHOLD_STEPS[0] * policy->cur) {
-		int smart_up_inc =
-			(policy->max - policy->cur) / SUP_FREQ_STEPS[0];
-		int freq_next = 0;
-		int i = 0;
-		
-		//20130429 UPDATE
-		int check_idx =  0;
-		int check_freq = 0; 
-		int temp_up_inc =0;
-
-		if (counter < 5) {
-			counter++;
-			if (counter > 2) {				
-				phase = 1;
-			}
-		}
-		
-		nr_cpus = num_online_cpus();
-		dbs_tuners_ins.two_phase_freq = two_phase_freq_array[nr_cpus-1];
-		if (dbs_tuners_ins.two_phase_freq < policy->cur)
-			phase = 1;
-		if (dbs_tuners_ins.two_phase_freq != 0 && phase == 0) {			
-			dbs_freq_increase(policy, dbs_tuners_ins.two_phase_freq);
-		} else {			
-			if (policy->cur < policy->max)
-				this_dbs_info->rate_mult =
-					dbs_tuners_ins.sampling_down_factor;
-			dbs_freq_increase(policy, policy->max);
-		}
-
-		for (i = (SUP_MAX_STEP - 1); i > 0; i--) {
-			if (max_load_freq > SUP_THRESHOLD_STEPS[i]
-							* policy->cur) {
-				smart_up_inc = (policy->max - policy->cur)
-						/ SUP_FREQ_STEPS[i];
-			
-				break;
-			}
-		}
-		
-		//20130429 UPDATE
-		check_idx =  pre_freq_idx[core_j].freq_idx;
-		check_freq = pre_freq_idx[core_j].freq_value; 
-		if ( ( check_idx == 0) 
-		|| (this_dbs_info->freq_table[check_idx].frequency 
-			!=  policy->cur) )
-		{
-			int i = 0;
-			for( i =0; i < SUP_FREQ_LEVEL; i ++)
-			{
-				if (this_dbs_info->freq_table[i].frequency == policy->cur)
-				{
-					
-					pre_freq_idx[core_j].freq_idx = i;
-					pre_freq_idx[core_j].freq_value = policy->cur;
-					check_idx =  i;
-					check_freq = policy->cur; 
-					break;
-				}
-			}
-			
-		}
-		if( check_idx < SUP_FREQ_LEVEL-1 ){ 
-		temp_up_inc =  
-			this_dbs_info->freq_table[check_idx + 1].frequency 
-			- check_freq;
-		}
-			
-		if (smart_up_inc < temp_up_inc )
-			smart_up_inc = temp_up_inc;
-
-		freq_next = MIN((policy->cur + smart_up_inc), policy->max);
-
-			
-			if (policy->cur >= dbs_tuners_ins.smart_high_slow_up_freq){
-			int idx = hist_load_high[core_j].hist_load_cnt;
-			int avg_hist_load = 0;
-			
-				if (idx >= dbs_tuners_ins.smart_high_slow_up_dur)
-				idx = 0;
-				
-			hist_load_high[core_j].hist_max_load[idx] = max_load;
-			hist_load_high[core_j].hist_load_cnt = idx + 1;
-
-			/* note : check history_load and get_sum_hist_load */
-			if (hist_load_high[core_j].
-					hist_max_load[dbs_tuners_ins.smart_high_slow_up_dur - 1] > 0) {
-				int sum_hist_load_freq = 0;
-				int i = 0;
-					for (i = 0; i < dbs_tuners_ins.smart_high_slow_up_dur; i++)
-					sum_hist_load_freq +=
-					hist_load_high[core_j].hist_max_load[i];
-
-				avg_hist_load = sum_hist_load_freq
-							/dbs_tuners_ins.smart_high_slow_up_dur;
-						
-					if (avg_hist_load > dbs_tuners_ins.smart_slow_up_load){
-					reset_hist_high(&hist_load_high[core_j]);
-					freq_next = MIN((policy->cur + temp_up_inc), policy->max);
-				} else
-					freq_next = policy->cur;
-			} else {
-				freq_next = policy->cur;
-			}
-			
-			} else if (policy->cur >= dbs_tuners_ins.smart_slow_up_freq ) {
-			int idx = hist_load[core_j].hist_load_cnt;
-			int avg_hist_load = 0;
-
-				if (idx >= dbs_tuners_ins.smart_slow_up_dur)
-				idx = 0;
-
-			hist_load[core_j].hist_max_load[idx] = max_load;
-			hist_load[core_j].hist_load_cnt = idx + 1;
-
-			/* note : check history_load and get_sum_hist_load */
-			if (hist_load[core_j].
-					hist_max_load[dbs_tuners_ins.smart_slow_up_dur - 1] > 0) {
-				int sum_hist_load_freq = 0;
-				int i = 0;
-					for (i = 0; i < dbs_tuners_ins.smart_slow_up_dur; i++)
-					sum_hist_load_freq +=
-					hist_load[core_j].hist_max_load[i];
-
-				avg_hist_load = sum_hist_load_freq
-							/ dbs_tuners_ins.smart_slow_up_dur ;
-
-					if (avg_hist_load > dbs_tuners_ins.smart_slow_up_load){
-					reset_hist(&hist_load[core_j]);
-					freq_next = MIN((policy->cur + temp_up_inc), policy->max);
-				} else
-					freq_next = policy->cur;
-			} else {
-				freq_next = policy->cur;
-			}
-		} else {
-			reset_hist(&hist_load[core_j]);
-		}
-		if (freq_next == policy->max)
-			this_dbs_info->rate_mult =
-				dbs_tuners_ins.sampling_down_factor;
-
-		dbs_freq_increase(policy, freq_next);
-
-		return;
-	}
-	}else{
-	/* Check for frequency increase */
-	if (max_load_freq > dbs_tuners_ins.up_threshold * policy->cur) {
-			int target;
-			int inc;
-
-			if (policy->cur < dbs_tuners_ins.step_up_early_hispeed) {
-				target = dbs_tuners_ins.step_up_early_hispeed;
-			}else if (policy->cur < dbs_tuners_ins.step_up_interim_hispeed) {
-				if(policy->cur == dbs_tuners_ins.step_up_early_hispeed) {
-					if(this_dbs_info->freq_stay_count <
-						dbs_tuners_ins.sampling_early_factor) {
-						this_dbs_info->freq_stay_count++;
-						return;
-					}
-				}
-				this_dbs_info->freq_stay_count = 1;
-				inc = (policy->max * dbs_tuners_ins.freq_step) / 100;
-				target = min(dbs_tuners_ins.step_up_interim_hispeed,
-					policy->cur + inc);
-			}else {
-				if(policy->cur == dbs_tuners_ins.step_up_interim_hispeed) {
-					if(this_dbs_info->freq_stay_count <
-						dbs_tuners_ins.sampling_interim_factor) {
-						this_dbs_info->freq_stay_count++;
-						return;
-					}
-				}
-				this_dbs_info->freq_stay_count = 1;
-				target = policy->max;
-
-				//int inc = (policy->max * dbs_tuners_ins.freq_step) / 100;
-				//target = min(policy->max, policy->cur + inc);
-			}
-
-			pr_debug("%s: cpu=%d, cur=%d, target=%d\n",
-				__func__, policy->cpu, policy->cur, target);
-
-			/* If switching to max speed, apply sampling_down_factor */
-			if (target == policy->max)
-				this_dbs_info->rate_mult =
-					dbs_tuners_ins.sampling_down_factor;
-
-			dbs_freq_increase(policy, target);
-		return;
-	}
-	}
-	if (counter > 0) {
-		counter--;
-		if (counter == 0) {						
-			phase = 0;
-		}
-	}
-
-	if (num_online_cpus() > 1) {
-
-		if (max_load_other_cpu >
-				dbs_tuners_ins.up_threshold_any_cpu_load) {
-			if (policy->cur < dbs_tuners_ins.sync_freq)
-				dbs_freq_increase(policy,
-						dbs_tuners_ins.sync_freq);
-			return;
-		}
-
-		if (max_load_freq > dbs_tuners_ins.up_threshold_multi_core *
-								policy->cur) {
-			if (policy->cur < dbs_tuners_ins.optimal_freq)
-				dbs_freq_increase(policy,
-						dbs_tuners_ins.optimal_freq);
-			return;
-		}
-	}
-
-	if (input_event_boosted()) {
-		return;
-	}
-
-	/* Check for frequency decrease */
-	/* if we cannot reduce the frequency anymore, break out early */
-	if (policy->cur == policy->min)
-		return;
-
-	/*
-	 * The optimal frequency is the frequency that is the lowest that
-	 * can support the current CPU usage without triggering the up
-	 * policy. To be safe, we focus 10 points under the threshold.
-	 */
-	if (max_load_freq <
-	    (dbs_tuners_ins.up_threshold - dbs_tuners_ins.down_differential) *
-	     policy->cur) {
-		unsigned int freq_next;
-		freq_next = max_load_freq /
-				(dbs_tuners_ins.up_threshold -
-				 dbs_tuners_ins.down_differential);
-
-		pr_debug("%s: cpu=%d, cur=%d, target=%d (down)\n",
-			__func__, policy->cpu, policy->cur, freq_next);
-
-/* PATCH : SMART_UP */
-		if (dbs_tuners_ins.smart_up && ( core_j + 1 ) > dbs_tuners_ins.smart_each_off ){
-
-			if (freq_next >= dbs_tuners_ins.smart_high_slow_up_freq){
-			int idx = hist_load_high[core_j].hist_load_cnt;
-
-				if (idx >= dbs_tuners_ins.smart_high_slow_up_dur )
-				idx = 0;
-
-			hist_load_high[core_j].hist_max_load[idx] = max_load;
-			hist_load_high[core_j].hist_load_cnt = idx + 1;
-
-		
-			}else if (freq_next >= dbs_tuners_ins.smart_slow_up_freq) {
-			int idx = hist_load[core_j].hist_load_cnt;
-
-				if (idx >= dbs_tuners_ins.smart_slow_up_dur)
-				idx = 0;
-
-			hist_load[core_j].hist_max_load[idx] = max_load;
-			hist_load[core_j].hist_load_cnt = idx + 1;
-
-			reset_hist_high(&hist_load_high[core_j]);
-
-		
-			} else if (policy->cur >= dbs_tuners_ins.smart_slow_up_freq) {
-			reset_hist(&hist_load[core_j]);
-			reset_hist_high(&hist_load_high[core_j]);
-
-				
-			}
-		}
-//#endif
-
-		/* No longer fully busy, reset rate_mult */
-		this_dbs_info->rate_mult = 1;
-		this_dbs_info->freq_stay_count = 1;
-
-
-		if (freq_next < policy->min)
-			freq_next = policy->min;
-
-		if (num_online_cpus() > 1) {
-			if (max_load_other_cpu >
-			(dbs_tuners_ins.up_threshold_multi_core -
-			dbs_tuners_ins.down_differential) &&
-			freq_next < dbs_tuners_ins.sync_freq)
-				freq_next = dbs_tuners_ins.sync_freq;
-
-			if (max_load_freq >
-				 ((dbs_tuners_ins.up_threshold_multi_core -
-				  dbs_tuners_ins.down_differential_multi_core) *
-				  policy->cur) &&
-				freq_next < dbs_tuners_ins.optimal_freq)
-				freq_next = dbs_tuners_ins.optimal_freq;
-
-		}
-		if (!dbs_tuners_ins.powersave_bias) {
-			__cpufreq_driver_target(policy, freq_next,
-					CPUFREQ_RELATION_L);
-		} else {
-			int freq = powersave_bias_target(policy, freq_next,
-					CPUFREQ_RELATION_L);
-			__cpufreq_driver_target(policy, freq,
-				CPUFREQ_RELATION_L);
-		}
-	}
-}
-
-static void do_dbs_timer(struct work_struct *work)
-{
-	struct cpu_dbs_info_s *dbs_info =
-		container_of(work, struct cpu_dbs_info_s, work.work);
-	unsigned int cpu = dbs_info->cpu;
-	int sample_type = dbs_info->sample_type;
-	int delay = msecs_to_jiffies(50);
-
-	if (skip_intellidemand)
-		goto sched_wait;
-
-	mutex_lock(&dbs_info->timer_mutex);
-
-	/* Common NORMAL_SAMPLE setup */
-	dbs_info->sample_type = DBS_NORMAL_SAMPLE;
-	if (!dbs_tuners_ins.powersave_bias ||
-	    sample_type == DBS_NORMAL_SAMPLE) {
-		dbs_check_cpu(dbs_info);
-		if (dbs_info->freq_lo) {
-			/* Setup timer for SUB_SAMPLE */
-			dbs_info->sample_type = DBS_SUB_SAMPLE;
-			delay = dbs_info->freq_hi_jiffies;
-		} else {
-			/* We want all CPUs to do sampling nearly on
-			 * same jiffy
-			 */
-			delay = usecs_to_jiffies(dbs_tuners_ins.sampling_rate
-				* dbs_info->rate_mult);
-
-			if (num_online_cpus() > 1)
-				delay -= jiffies % delay;
-		}
-	} else {
-		if (input_event_boosted())
-			goto sched_wait;
-
-		__cpufreq_driver_target(dbs_info->cur_policy,
-			dbs_info->freq_lo, CPUFREQ_RELATION_H);
-		delay = dbs_info->freq_lo_jiffies;
-	}
-sched_wait:
-	queue_delayed_work_on(cpu, dbs_wq, &dbs_info->work, delay);
-	mutex_unlock(&dbs_info->timer_mutex);
-}
-
-static inline void dbs_timer_init(struct cpu_dbs_info_s *dbs_info)
-{
-	/* We want all CPUs to do sampling nearly on same jiffy */
-	int delay = usecs_to_jiffies(dbs_tuners_ins.sampling_rate);
-
-	if (num_online_cpus() > 1)
-		delay -= jiffies % delay;
-
-	dbs_info->sample_type = DBS_NORMAL_SAMPLE;
-	INIT_DELAYED_WORK_DEFERRABLE(&dbs_info->work, do_dbs_timer);
-	queue_delayed_work_on(dbs_info->cpu, dbs_wq, &dbs_info->work, delay);
-}
-
-static inline void dbs_timer_exit(struct cpu_dbs_info_s *dbs_info)
-{
-	cancel_delayed_work_sync(&dbs_info->work);
-}
-
-/*
- * Not all CPUs want IO time to be accounted as busy; this dependson how
- * efficient idling at a higher frequency/voltage is.
- * Pavel Machek says this is not so for various generations of AMD and old
- * Intel systems.
- * Mike Chan (androidlcom) calis this is also not true for ARM.
- * Because of this, whitelist specific known (series) of CPUs by default, and
- * leave all others up to the user.
- */
-static int should_io_be_busy(void)
-{
-#if defined(CONFIG_X86)
-	/*
-	 * For Intel, Core 2 (model 15) andl later have an efficient idle.
-	 */
-	if (boot_cpu_data.x86_vendor == X86_VENDOR_INTEL &&
-	    boot_cpu_data.x86 == 6 &&
-	    boot_cpu_data.x86_model >= 15)
-		return 1;
-#endif
-	return 0;
-}
-
-static void dbs_refresh_callback(struct work_struct *work)
-{
-	struct cpufreq_policy *policy;
-	struct cpu_dbs_info_s *this_dbs_info;
-	struct dbs_work_struct *dbs_work;
-	unsigned int cpu;
-
-	dbs_work = container_of(work, struct dbs_work_struct, work);
-	cpu = dbs_work->cpu;
-
-	get_online_cpus();
-
-	if (lock_policy_rwsem_write(cpu) < 0)
-		goto bail_acq_sema_failed;
-
-	this_dbs_info = &per_cpu(od_cpu_dbs_info, cpu);
-	policy = this_dbs_info->cur_policy;
-	if (!policy) {
-		/* CPU not using intellidemand governor */
-		goto bail_incorrect_governor;
-	}
-
-	if (policy->cur < policy->max) {
-		/*
-		 * Arch specific cpufreq driver may fail.
-		 * Don't update governor frequency upon failure.
-		 */
-		if (__cpufreq_driver_target(policy, policy->max,
-					CPUFREQ_RELATION_L) >= 0)
-			policy->cur = policy->max;
-
-		this_dbs_info->prev_cpu_idle = get_cpu_idle_time(cpu,
-				&this_dbs_info->prev_cpu_wall);
-	}
-
-bail_incorrect_governor:
-	unlock_policy_rwsem_write(cpu);
-
-bail_acq_sema_failed:
-	put_online_cpus();
-	return;
-}
-
-static int dbs_migration_notify(struct notifier_block *nb,
-				unsigned long target_cpu, void *arg)
-{
-	struct cpu_dbs_info_s *target_dbs_info =
-		&per_cpu(od_cpu_dbs_info, target_cpu);
-
-	atomic_set(&target_dbs_info->src_sync_cpu, (int)arg);
-	wake_up(&target_dbs_info->sync_wq);
-
-	return NOTIFY_OK;
-}
-
-static struct notifier_block dbs_migration_nb = {
-	.notifier_call = dbs_migration_notify,
-};
-
-static int sync_pending(struct cpu_dbs_info_s *this_dbs_info)
-{
-	return atomic_read(&this_dbs_info->src_sync_cpu) >= 0;
-}
-
-static int dbs_sync_thread(void *data)
-{
-	int src_cpu, cpu = (int)data;
-	unsigned int src_freq, src_max_load;
-	struct cpu_dbs_info_s *this_dbs_info, *src_dbs_info;
-	struct cpufreq_policy *policy;
-	int delay;
-
-	this_dbs_info = &per_cpu(od_cpu_dbs_info, cpu);
-
-	while (1) {
-		wait_event(this_dbs_info->sync_wq,
-			   sync_pending(this_dbs_info) ||
-			   kthread_should_stop());
-
-		if (kthread_should_stop())
-			break;
-
-		get_online_cpus();
-
-		src_cpu = atomic_read(&this_dbs_info->src_sync_cpu);
-		src_dbs_info = &per_cpu(od_cpu_dbs_info, src_cpu);
-		if (src_dbs_info != NULL &&
-		    src_dbs_info->cur_policy != NULL) {
-			src_freq = src_dbs_info->cur_policy->cur;
-			src_max_load = src_dbs_info->max_load;
-		} else {
-			src_freq = dbs_tuners_ins.sync_freq;
-			src_max_load = 0;
-		}
-
-		if (lock_policy_rwsem_write(cpu) < 0)
-			goto bail_acq_sema_failed;
-
-		if (!atomic_read(&this_dbs_info->sync_enabled)) {
-			atomic_set(&this_dbs_info->src_sync_cpu, -1);
-			put_online_cpus();
-			unlock_policy_rwsem_write(cpu);
-			continue;
-		}
-
-		policy = this_dbs_info->cur_policy;
-		if (!policy) {
-			/* CPU not using intellidemand governor */
-			goto bail_incorrect_governor;
-		}
-		delay = usecs_to_jiffies(dbs_tuners_ins.sampling_rate);
-
-
-		if (policy->cur < src_freq) {
-			/* cancel the next intellidemand sample */
-			cancel_delayed_work_sync(&this_dbs_info->work);
-
-			/*
-			 * Arch specific cpufreq driver may fail.
-			 * Don't update governor frequency upon failure.
-			 */
-			if (__cpufreq_driver_target(policy, src_freq,
-						    CPUFREQ_RELATION_L) >= 0) {
-				policy->cur = src_freq;
-				if (src_max_load > this_dbs_info->max_load) {
-					this_dbs_info->max_load = src_max_load;
-					this_dbs_info->prev_load = src_max_load;
-				}
-			}
-
-			/* reschedule the next intellidemand sample */
-			mutex_lock(&this_dbs_info->timer_mutex);
-			queue_delayed_work_on(cpu, dbs_wq,
-					      &this_dbs_info->work, delay);
-			mutex_unlock(&this_dbs_info->timer_mutex);
-		}
-
-bail_incorrect_governor:
-		unlock_policy_rwsem_write(cpu);
-bail_acq_sema_failed:
-		put_online_cpus();
-		atomic_set(&this_dbs_info->src_sync_cpu, -1);
-	}
-
-	return 0;
-}
-
-static void dbs_input_event(struct input_handle *handle, unsigned int type,
-		unsigned int code, int value)
-{
-	int i;
-	struct cpu_dbs_info_s *dbs_info;
-	unsigned long flags;
-	int input_event_min_freq;
-
-	if ((dbs_tuners_ins.powersave_bias == POWERSAVE_BIAS_MAXLEVEL) ||
-		(dbs_tuners_ins.powersave_bias == POWERSAVE_BIAS_MINLEVEL)) {
-		/* nothing to do */
-		return;
-	}
-
-	if (type == EV_SYN && code == SYN_REPORT) {		
-		spin_lock_irqsave(&input_boost_lock, flags);
-		input_event_boost = true;
-		ui_sampling_expired = jiffies + msecs_to_jiffies(dbs_tuners_ins.ui_timeout);
-		spin_unlock_irqrestore(&input_boost_lock, flags);
-
-		input_event_min_freq = input_event_min_freq_array[num_online_cpus() - 1];
-		for_each_online_cpu(i) {
-			dbs_info = &per_cpu(od_cpu_dbs_info, i);
-			if (dbs_info->cur_policy &&		
-				dbs_info->cur_policy->cur < input_event_min_freq) {
-				wake_up_process(per_cpu(up_task, i));
-			}
-		}
-	}
-}
-
-static int input_dev_filter(const char *input_dev_name)
-{
-	if (strstr(input_dev_name, "touchscreen") ||
- 	    strstr(input_dev_name, "touch_dev") ||
- 	    strstr(input_dev_name, "sec-touchscreen") ||
-	    strstr(input_dev_name, "keypad")) {
-		return 0; 
-	} else {
-		return 1;
-	}
-}
-
-
-static int dbs_input_connect(struct input_handler *handler,
-		struct input_dev *dev, const struct input_device_id *id)
-{
-	struct input_handle *handle;
-	int error;
-	
-	if (input_dev_filter(dev->name))
-		return -ENODEV;
-
-	handle = kzalloc(sizeof(struct input_handle), GFP_KERNEL);
-	if (!handle)
-		return -ENOMEM;
-
-	handle->dev = dev;
-	handle->handler = handler;
-	handle->name = "cpufreq";
-
-	error = input_register_handle(handle);
-	if (error)
-		goto err2;
-
-	error = input_open_device(handle);
-	if (error)
-		goto err1;
-
-	return 0;
-err1:
-	input_unregister_handle(handle);
-err2:
-	kfree(handle);
-	return error;
-}
-
-static void dbs_input_disconnect(struct input_handle *handle)
-{
-	input_close_device(handle);
-	input_unregister_handle(handle);
-	kfree(handle);
-}
-
-static const struct input_device_id dbs_ids[] = {
-	{ .driver_info = 1 },
-	{ },
-};
-
-static struct input_handler dbs_input_handler = {
-	.event		= dbs_input_event,
-	.connect	= dbs_input_connect,
-	.disconnect	= dbs_input_disconnect,
-	.name		= "cpufreq_ond",
-	.id_table	= dbs_ids,
-};
-
-int set_input_event_min_freq(int cpufreq)
-{
-	int i  = 0;
-	for ( i = 0 ; i < NR_CPUS; i++)
-		input_event_min_freq_array[i] = cpufreq;
-	return 0;
-}
-
-void set_input_event_min_freq_by_cpu ( int cpu_nr, int cpufreq){
-	input_event_min_freq_array[cpu_nr-1] = cpufreq;
-}
-
-static int cpufreq_governor_dbs(struct cpufreq_policy *policy,
-				   unsigned int event)
-{
-	unsigned int cpu = policy->cpu;
-	struct cpu_dbs_info_s *this_dbs_info;
-	unsigned int j;
-	int rc;
-
-	this_dbs_info = &per_cpu(od_cpu_dbs_info, cpu);
-
-	switch (event) {
-	case CPUFREQ_GOV_START:
-		if ((!cpu_online(cpu)) || (!policy->cur))
-			return -EINVAL;
-
-		mutex_lock(&dbs_mutex);
-
-		dbs_enable++;
-		for_each_cpu(j, policy->cpus) {
-			struct cpu_dbs_info_s *j_dbs_info;
-			j_dbs_info = &per_cpu(od_cpu_dbs_info, j);
-			j_dbs_info->cur_policy = policy;
-
-			j_dbs_info->prev_cpu_idle = get_cpu_idle_time(j,
-						&j_dbs_info->prev_cpu_wall);
-			if (dbs_tuners_ins.ignore_nice)
-				j_dbs_info->prev_cpu_nice =
-						kcpustat_cpu(j).cpustat[CPUTIME_NICE];
-			set_cpus_allowed(j_dbs_info->sync_thread,
-					 *cpumask_of(j));
-			if (!dbs_tuners_ins.powersave_bias)
-				atomic_set(&j_dbs_info->sync_enabled, 1);
-		}
-		this_dbs_info->cpu = cpu;
-		this_dbs_info->rate_mult = 1;
-		this_dbs_info->freq_stay_count = 1;
-		intellidemand_powersave_bias_init_cpu(cpu);
-		/*
-		 * Start the timerschedule work, when this governor
-		 * is used for first time
-		 */
-		if (dbs_enable == 1) {
-			unsigned int latency;
-
-			rc = sysfs_create_group(cpufreq_global_kobject,
-						&dbs_attr_group);
-			if (rc) {
-				mutex_unlock(&dbs_mutex);
-				return rc;
-			}
-
-			/* policy latency is in nS. Convert it to uS first */
-			latency = policy->cpuinfo.transition_latency / 1000;
-			if (latency == 0)
-				latency = 1;
-			/* Bring kernel and HW constraints together */
-			min_sampling_rate = max(min_sampling_rate,
-					MIN_LATENCY_MULTIPLIER * latency);
-			dbs_tuners_ins.sampling_rate =
-				max(min_sampling_rate,
-				    latency * LATENCY_MULTIPLIER);
-			if (dbs_tuners_ins.sampling_rate < DEF_SAMPLING_RATE)
-				dbs_tuners_ins.sampling_rate = DEF_SAMPLING_RATE;
-			dbs_tuners_ins.origin_sampling_rate = dbs_tuners_ins.sampling_rate;
-			dbs_tuners_ins.io_is_busy = should_io_be_busy();
-
-			if (dbs_tuners_ins.optimal_freq == 0)
-				dbs_tuners_ins.optimal_freq = policy->min;
-
-			if (dbs_tuners_ins.sync_freq == 0)
-				dbs_tuners_ins.sync_freq = policy->min;
-
-			atomic_notifier_chain_register(&migration_notifier_head,
-					&dbs_migration_nb);
-		}
-		if (!cpu)
-			rc = input_register_handler(&dbs_input_handler);
-		mutex_unlock(&dbs_mutex);
-
-
-		if (!intellidemand_powersave_bias_setspeed(
-					this_dbs_info->cur_policy,
-					NULL,
-					dbs_tuners_ins.powersave_bias))
-			dbs_timer_init(this_dbs_info);
-		break;
-
-	case CPUFREQ_GOV_STOP:
-		dbs_timer_exit(this_dbs_info);
-
-		mutex_lock(&dbs_mutex);
-		dbs_enable--;
-
-		for_each_cpu(j, policy->cpus) {
-			struct cpu_dbs_info_s *j_dbs_info;
-			j_dbs_info = &per_cpu(od_cpu_dbs_info, j);
-			atomic_set(&j_dbs_info->sync_enabled, 0);
-		}
-
-		/* If device is being removed, policy is no longer
-		 * valid. */
-		this_dbs_info->cur_policy = NULL;
-		if (!cpu)
-			input_unregister_handler(&dbs_input_handler);
-		if (!dbs_enable) {
-			sysfs_remove_group(cpufreq_global_kobject,
-					   &dbs_attr_group);
-			atomic_notifier_chain_unregister(
-				&migration_notifier_head,
-				&dbs_migration_nb);
-		}
-
-		mutex_unlock(&dbs_mutex);
-
-		break;
-
-	case CPUFREQ_GOV_LIMITS:
-		if (this_dbs_info->cur_policy == NULL) {
-			pr_debug("Unable to limit cpu freq due to cur_policy == NULL\n");
-			return -EPERM;
-		}
-		mutex_lock(&this_dbs_info->timer_mutex);
-		if (policy->max < this_dbs_info->cur_policy->cur)
-			__cpufreq_driver_target(this_dbs_info->cur_policy,
-				policy->max, CPUFREQ_RELATION_H);
-		else if (policy->min > this_dbs_info->cur_policy->cur)
-			__cpufreq_driver_target(this_dbs_info->cur_policy,
-				policy->min, CPUFREQ_RELATION_L);
-		else if (dbs_tuners_ins.powersave_bias != 0)
-			intellidemand_powersave_bias_setspeed(
-				this_dbs_info->cur_policy,
-				policy,
-				dbs_tuners_ins.powersave_bias);
-		mutex_unlock(&this_dbs_info->timer_mutex);
-		break;
-	}
-	return 0;
-}
-
-static int cpufreq_gov_dbs_up_task(void *data)
-{
-	struct cpufreq_policy *policy;
-	struct cpu_dbs_info_s *this_dbs_info;
-	unsigned int cpu = smp_processor_id();
-	int input_event_min_freq;
-
-	while (1) {
-		set_current_state(TASK_INTERRUPTIBLE);
-		schedule();
-
-		if (kthread_should_stop())
-			break;
-
-		set_current_state(TASK_RUNNING);
-
-		get_online_cpus();
-
-		if (lock_policy_rwsem_write(cpu) < 0)
-			goto bail_acq_sema_failed;
-
-		this_dbs_info = &per_cpu(od_cpu_dbs_info, cpu);
-		policy = this_dbs_info->cur_policy;
-		if (!policy) {
-			
-			goto bail_incorrect_governor;
-		}
-
-		mutex_lock(&this_dbs_info->timer_mutex);
-
-		input_event_min_freq = input_event_min_freq_array[num_online_cpus() - 1];
-		if (policy->cur < input_event_min_freq) {
-			
-			dbs_tuners_ins.powersave_bias = 0;
-			dbs_freq_increase(policy, input_event_min_freq);
-			this_dbs_info->prev_cpu_idle = get_cpu_idle_time(cpu, &this_dbs_info->prev_cpu_wall);
-		}
-
-		mutex_unlock(&this_dbs_info->timer_mutex);
-
-bail_incorrect_governor:
-		unlock_policy_rwsem_write(cpu);
-
-bail_acq_sema_failed:
-		put_online_cpus();
-
-		dbs_tuners_ins.sampling_rate = dbs_tuners_ins.ui_sampling_rate;
-	}
-
-	return 0;
-}
-
-#ifdef CONFIG_POWERSUSPEND
-static void cpufreq_intellidemand_power_suspend(struct power_suspend *h)
-{
-	mutex_lock(&dbs_mutex);
-	stored_sampling_rate = dbs_tuners_ins.sampling_rate;
-	dbs_tuners_ins.sampling_rate = DEF_SAMPLING_RATE * 6;
-	update_sampling_rate(dbs_tuners_ins.sampling_rate);
-	mutex_unlock(&dbs_mutex);
-}
-
-static void cpufreq_intellidemand_power_resume(struct power_suspend *h)
-{
-	mutex_lock(&dbs_mutex);
-	dbs_tuners_ins.sampling_rate = stored_sampling_rate;
-	update_sampling_rate(dbs_tuners_ins.sampling_rate);
-	mutex_unlock(&dbs_mutex);
-}
-
-static struct power_suspend cpufreq_intellidemand_power_suspend_info = {
-	.suspend = cpufreq_intellidemand_power_suspend,
-	.resume = cpufreq_intellidemand_power_resume,
-};
-#endif
-
-static int __init cpufreq_gov_dbs_init(void)
-{
-	u64 idle_time;
-	unsigned int i;
-	struct sched_param param = { .sched_priority = MAX_RT_PRIO-1 };
-	struct task_struct *pthread;
-	int cpu = get_cpu();
-
-	idle_time = get_cpu_idle_time_us(cpu, NULL);
-	put_cpu();
-	if (idle_time != -1ULL) {
-		/* Idle micro accounting is supported. Use finer thresholds */
-		dbs_tuners_ins.up_threshold = MICRO_FREQUENCY_UP_THRESHOLD;
-		dbs_tuners_ins.down_differential =
-					MICRO_FREQUENCY_DOWN_DIFFERENTIAL;
-		/*
-		 * In nohz/micro accounting case we set the minimum frequency
-		 * not depending on HZ, but fixed (very low). The deferred
-		 * timer might skip some samples if idle/sleeping as needed.
-		*/
-		min_sampling_rate = MICRO_FREQUENCY_MIN_SAMPLE_RATE;
-	} else {
-		/* For correct statistics, we need 10 ticks for each measure */
-		min_sampling_rate =
-			MIN_SAMPLING_RATE_RATIO * jiffies_to_usecs(10);
-	}
-
-	dbs_wq = alloc_workqueue("intellidemand_dbs_wq", WQ_HIGHPRI, 0);
-	if (!dbs_wq) {
-		printk(KERN_ERR "Failed to create intellidemand_dbs_wq workqueue\n");
-		return -EFAULT;
-	}
-	for_each_possible_cpu(i) {
-		struct cpu_dbs_info_s *this_dbs_info =
-			&per_cpu(od_cpu_dbs_info, i);
-		struct dbs_work_struct *dbs_work =
-			&per_cpu(dbs_refresh_work, i);
-
-		pthread = kthread_create_on_node(cpufreq_gov_dbs_up_task,
-								NULL, cpu_to_node(i),
-								"kdbs_up/%d", i);
-		if (likely(!IS_ERR(pthread))) {
-			kthread_bind(pthread, i);
-			sched_setscheduler_nocheck(pthread, SCHED_FIFO, &param);
-			get_task_struct(pthread);
-			per_cpu(up_task, i) = pthread;
-		}
-
-		mutex_init(&this_dbs_info->timer_mutex);
-		INIT_WORK(&dbs_work->work, dbs_refresh_callback);
-		dbs_work->cpu = i;
-
-		atomic_set(&this_dbs_info->src_sync_cpu, -1);
-		init_waitqueue_head(&this_dbs_info->sync_wq);
-
-		this_dbs_info->sync_thread = kthread_run(dbs_sync_thread,
-							 (void *)i,
-							 "dbs_sync/%d", i);
-	}
-
-#ifdef CONFIG_POWERSUSPEND
-	register_power_suspend(&cpufreq_intellidemand_power_suspend_info);
-#endif
-	return cpufreq_register_governor(&cpufreq_gov_intellidemand);
-}
-
-static void __exit cpufreq_gov_dbs_exit(void)
-{
-	unsigned int i;
-
-	cpufreq_unregister_governor(&cpufreq_gov_intellidemand);
-	for_each_possible_cpu(i) {
-		struct cpu_dbs_info_s *this_dbs_info =
-			&per_cpu(od_cpu_dbs_info, i);
-		mutex_destroy(&this_dbs_info->timer_mutex);
-		kthread_stop(this_dbs_info->sync_thread);
-		if (per_cpu(up_task, i)) {
-			kthread_stop(per_cpu(up_task, i));
-			put_task_struct(per_cpu(up_task, i));
-		}
-	}
-	destroy_workqueue(dbs_wq);
-}
-
-MODULE_AUTHOR("Venkatesh Pallipadi <venkatesh.pallipadi@intel.com>");
-MODULE_AUTHOR("Alexey Starikovskiy <alexey.y.starikovskiy@intel.com>");
-MODULE_AUTHOR("Paul Reioux <reioux@gmail.com>");
-MODULE_DESCRIPTION("'cpufreq_intellidemand' - A dynamic cpufreq governor for "
-	"Low Latency Frequency Transition capable processors");
-MODULE_LICENSE("GPL");
-
-#ifdef CONFIG_CPU_FREQ_DEFAULT_GOV_INTELLIDEMAND
-fs_initcall(cpufreq_gov_dbs_init);
-#else
-module_init(cpufreq_gov_dbs_init);
-#endif
-module_exit(cpufreq_gov_dbs_exit);
+
+
+
+
+<!DOCTYPE html>
+<html lang="en" class=" is-copy-enabled is-u2f-enabled">
+  <head prefix="og: http://ogp.me/ns# fb: http://ogp.me/ns/fb# object: http://ogp.me/ns/object# article: http://ogp.me/ns/article# profile: http://ogp.me/ns/profile#">
+    <meta charset='utf-8'>
+    
+
+    <link crossorigin="anonymous" href="https://assets-cdn.github.com/assets/frameworks-cb4ede7df6d8670c4051172e4d6bc6916b3c765fa15b4ee9b348f157fdb85114.css" integrity="sha256-y07effbYZwxAURcuTWvGkWs8dl+hW07ps0jxV/24URQ=" media="all" rel="stylesheet" />
+    <link crossorigin="anonymous" href="https://assets-cdn.github.com/assets/github-7e46d1eb3e9f3759fbc24e933b1dd00031faca1f6e2998d205ac52c2eddb8569.css" integrity="sha256-fkbR6z6fN1n7wk6TOx3QADH6yh9uKZjSBaxSwu3bhWk=" media="all" rel="stylesheet" />
+    
+    
+    
+    
+
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+    <meta http-equiv="Content-Language" content="en">
+    <meta name="viewport" content="width=device-width">
+    
+    <title>DORIMANX_LG_STOCK_LP_KERNEL/cpufreq_intellidemand.c at master · dorimanx/DORIMANX_LG_STOCK_LP_KERNEL</title>
+    <link rel="search" type="application/opensearchdescription+xml" href="/opensearch.xml" title="GitHub">
+    <link rel="fluid-icon" href="https://github.com/fluidicon.png" title="GitHub">
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png">
+    <link rel="apple-touch-icon" sizes="57x57" href="/apple-touch-icon-57x57.png">
+    <link rel="apple-touch-icon" sizes="60x60" href="/apple-touch-icon-60x60.png">
+    <link rel="apple-touch-icon" sizes="72x72" href="/apple-touch-icon-72x72.png">
+    <link rel="apple-touch-icon" sizes="76x76" href="/apple-touch-icon-76x76.png">
+    <link rel="apple-touch-icon" sizes="114x114" href="/apple-touch-icon-114x114.png">
+    <link rel="apple-touch-icon" sizes="120x120" href="/apple-touch-icon-120x120.png">
+    <link rel="apple-touch-icon" sizes="144x144" href="/apple-touch-icon-144x144.png">
+    <link rel="apple-touch-icon" sizes="152x152" href="/apple-touch-icon-152x152.png">
+    <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon-180x180.png">
+    <meta property="fb:app_id" content="1401488693436528">
+
+      <meta content="https://avatars0.githubusercontent.com/u/1135626?v=3&amp;s=400" name="twitter:image:src" /><meta content="@github" name="twitter:site" /><meta content="summary" name="twitter:card" /><meta content="dorimanx/DORIMANX_LG_STOCK_LP_KERNEL" name="twitter:title" /><meta content="DORIMANX_LG_STOCK_LP_KERNEL - Kernel for LG G2 LP STOCK/MODDED ROM" name="twitter:description" />
+      <meta content="https://avatars0.githubusercontent.com/u/1135626?v=3&amp;s=400" property="og:image" /><meta content="GitHub" property="og:site_name" /><meta content="object" property="og:type" /><meta content="dorimanx/DORIMANX_LG_STOCK_LP_KERNEL" property="og:title" /><meta content="https://github.com/dorimanx/DORIMANX_LG_STOCK_LP_KERNEL" property="og:url" /><meta content="DORIMANX_LG_STOCK_LP_KERNEL - Kernel for LG G2 LP STOCK/MODDED ROM" property="og:description" />
+      <meta name="browser-stats-url" content="https://api.github.com/_private/browser/stats">
+    <meta name="browser-errors-url" content="https://api.github.com/_private/browser/errors">
+    <link rel="assets" href="https://assets-cdn.github.com/">
+    <link rel="web-socket" href="wss://live.github.com/_sockets/MTQ4NzY3MTg6NzFhNjNkZmRjOGViM2Y3NzYxNTczNmYxMGYzMzU4Y2U6YmYwYTZiZTg1MzgyOTBkZTRjNmJiNGNhYTQ1ZjFjZGU5YmIwYzkwMTU3NWM3M2I1YjAxZDAwZWE3NjI2MGM3MQ==--4cd401f0d984920ecdb0bdfc66e5ffeffc42fab4">
+    <meta name="pjax-timeout" content="1000">
+    <link rel="sudo-modal" href="/sessions/sudo_modal">
+    <meta name="request-id" content="68C89757:4449:3581A11:57FC3DAE" data-pjax-transient>
+
+    <meta name="msapplication-TileImage" content="/windows-tile.png">
+    <meta name="msapplication-TileColor" content="#ffffff">
+    <meta name="selected-link" value="repo_source" data-pjax-transient>
+
+    <meta name="google-site-verification" content="KT5gs8h0wvaagLKAVWq8bbeNwnZZK1r1XQysX3xurLU">
+<meta name="google-site-verification" content="ZzhVyEFwb7w3e0-uOTltm8Jsck2F5StVihD0exw2fsA">
+    <meta name="google-analytics" content="UA-3769691-2">
+
+<meta content="collector.githubapp.com" name="octolytics-host" /><meta content="github" name="octolytics-app-id" /><meta content="68C89757:4449:3581A11:57FC3DAE" name="octolytics-dimension-request_id" /><meta content="14876718" name="octolytics-actor-id" /><meta content="xDARKMATT3Rx" name="octolytics-actor-login" /><meta content="97b4819330c52f603860689e44ed44d60c562cbfad7c2fdb76bf36d741918edd" name="octolytics-actor-hash" />
+<meta content="/&lt;user-name&gt;/&lt;repo-name&gt;/blob/show" data-pjax-transient="true" name="analytics-location" />
+
+
+
+  <meta class="js-ga-set" name="dimension1" content="Logged In">
+
+
+
+        <meta name="hostname" content="github.com">
+    <meta name="user-login" content="xDARKMATT3Rx">
+
+        <meta name="expected-hostname" content="github.com">
+      <meta name="js-proxy-site-detection-payload" content="YmU2Y2I0YzJiYzVmYmUwMWJlZTAwODJkOTFhZWJiZmZjMTM4ZWU1ODlhNTc0ZWI3NjQ2NGZkZDI1YmIzOGY3Mnx7InJlbW90ZV9hZGRyZXNzIjoiMTA0LjIwMC4xNTEuODciLCJyZXF1ZXN0X2lkIjoiNjhDODk3NTc6NDQ0OTozNTgxQTExOjU3RkMzREFFIiwidGltZXN0YW1wIjoxNDc2MTQ4NjU0fQ==">
+
+
+      <link rel="mask-icon" href="https://assets-cdn.github.com/pinned-octocat.svg" color="#4078c0">
+      <link rel="icon" type="image/x-icon" href="https://assets-cdn.github.com/favicon.ico">
+
+    <meta name="html-safe-nonce" content="68437b476ee4956a5c320099d35c1feb1163bc82">
+    <meta content="f78e7491e9567ee3ea1e9c71e2c0baa11c9ec78d" name="form-nonce" />
+
+    <meta http-equiv="x-pjax-version" content="6384a89ec92cc40140df65574d94da00">
+    
+
+      
+  <meta name="description" content="DORIMANX_LG_STOCK_LP_KERNEL - Kernel for LG G2 LP STOCK/MODDED ROM">
+  <meta name="go-import" content="github.com/dorimanx/DORIMANX_LG_STOCK_LP_KERNEL git https://github.com/dorimanx/DORIMANX_LG_STOCK_LP_KERNEL.git">
+
+  <meta content="1135626" name="octolytics-dimension-user_id" /><meta content="dorimanx" name="octolytics-dimension-user_login" /><meta content="33729870" name="octolytics-dimension-repository_id" /><meta content="dorimanx/DORIMANX_LG_STOCK_LP_KERNEL" name="octolytics-dimension-repository_nwo" /><meta content="true" name="octolytics-dimension-repository_public" /><meta content="false" name="octolytics-dimension-repository_is_fork" /><meta content="33729870" name="octolytics-dimension-repository_network_root_id" /><meta content="dorimanx/DORIMANX_LG_STOCK_LP_KERNEL" name="octolytics-dimension-repository_network_root_nwo" />
+  <link href="https://github.com/dorimanx/DORIMANX_LG_STOCK_LP_KERNEL/commits/master.atom" rel="alternate" title="Recent Commits to DORIMANX_LG_STOCK_LP_KERNEL:master" type="application/atom+xml">
+
+
+      <link rel="canonical" href="https://github.com/dorimanx/DORIMANX_LG_STOCK_LP_KERNEL/blob/master/drivers/cpufreq/cpufreq_intellidemand.c" data-pjax-transient>
+  </head>
+
+
+  <body class="logged-in  env-production linux vis-public page-blob">
+    <div id="js-pjax-loader-bar" class="pjax-loader-bar"><div class="progress"></div></div>
+    <a href="#start-of-content" tabindex="1" class="accessibility-aid js-skip-to-content">Skip to content</a>
+
+    
+    
+    
+
+
+
+        <div class="header header-logged-in true" role="banner">
+  <div class="container clearfix">
+
+    <a class="header-logo-invertocat" href="https://github.com/" data-hotkey="g d" aria-label="Homepage" data-ga-click="Header, go to dashboard, icon:logo">
+  <svg aria-hidden="true" class="octicon octicon-mark-github" height="28" version="1.1" viewBox="0 0 16 16" width="28"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0 0 16 8c0-4.42-3.58-8-8-8z"></path></svg>
+</a>
+
+
+        <div class="header-search scoped-search site-scoped-search js-site-search" role="search">
+  <!-- '"` --><!-- </textarea></xmp> --></option></form><form accept-charset="UTF-8" action="/dorimanx/DORIMANX_LG_STOCK_LP_KERNEL/search" class="js-site-search-form" data-scoped-search-url="/dorimanx/DORIMANX_LG_STOCK_LP_KERNEL/search" data-unscoped-search-url="/search" method="get"><div style="margin:0;padding:0;display:inline"><input name="utf8" type="hidden" value="&#x2713;" /></div>
+    <label class="form-control header-search-wrapper js-chromeless-input-container">
+      <div class="header-search-scope">This repository</div>
+      <input type="text"
+        class="form-control header-search-input js-site-search-focus js-site-search-field is-clearable"
+        data-hotkey="s"
+        name="q"
+        placeholder="Search"
+        aria-label="Search this repository"
+        data-unscoped-placeholder="Search GitHub"
+        data-scoped-placeholder="Search"
+        autocapitalize="off">
+    </label>
+</form></div>
+
+
+      <ul class="header-nav float-left" role="navigation">
+        <li class="header-nav-item">
+          <a href="/pulls" aria-label="Pull requests you created" class="js-selected-navigation-item header-nav-link" data-ga-click="Header, click, Nav menu - item:pulls context:user" data-hotkey="g p" data-selected-links="/pulls /pulls/assigned /pulls/mentioned /pulls">
+            Pull requests
+</a>        </li>
+        <li class="header-nav-item">
+          <a href="/issues" aria-label="Issues you created" class="js-selected-navigation-item header-nav-link" data-ga-click="Header, click, Nav menu - item:issues context:user" data-hotkey="g i" data-selected-links="/issues /issues/assigned /issues/mentioned /issues">
+            Issues
+</a>        </li>
+          <li class="header-nav-item">
+            <a class="header-nav-link" href="https://gist.github.com/" data-ga-click="Header, go to gist, text:gist">Gist</a>
+          </li>
+      </ul>
+
+    
+<ul class="header-nav user-nav float-right" id="user-links">
+  <li class="header-nav-item">
+    
+    <a href="/notifications" aria-label="You have no unread notifications" class="header-nav-link notification-indicator tooltipped tooltipped-s js-socket-channel js-notification-indicator" data-channel="tenant:1:notification-changed:14876718" data-ga-click="Header, go to notifications, icon:read" data-hotkey="g n">
+        <span class="mail-status "></span>
+        <svg aria-hidden="true" class="octicon octicon-bell" height="16" version="1.1" viewBox="0 0 14 16" width="14"><path d="M14 12v1H0v-1l.73-.58c.77-.77.81-2.55 1.19-4.42C2.69 3.23 6 2 6 2c0-.55.45-1 1-1s1 .45 1 1c0 0 3.39 1.23 4.16 5 .38 1.88.42 3.66 1.19 4.42l.66.58H14zm-7 4c1.11 0 2-.89 2-2H5c0 1.11.89 2 2 2z"></path></svg>
+</a>
+  </li>
+
+  <li class="header-nav-item dropdown js-menu-container">
+    <a class="header-nav-link tooltipped tooltipped-s js-menu-target" href="/new"
+       aria-label="Create new…"
+       data-ga-click="Header, create new, icon:add">
+      <svg aria-hidden="true" class="octicon octicon-plus float-left" height="16" version="1.1" viewBox="0 0 12 16" width="12"><path d="M12 9H7v5H5V9H0V7h5V2h2v5h5z"></path></svg>
+      <span class="dropdown-caret"></span>
+    </a>
+
+    <div class="dropdown-menu-content js-menu-content">
+      <ul class="dropdown-menu dropdown-menu-sw">
+        
+<a class="dropdown-item" href="/new" data-ga-click="Header, create new repository">
+  New repository
+</a>
+
+  <a class="dropdown-item" href="/new/import" data-ga-click="Header, import a repository">
+    Import repository
+  </a>
+
+
+  <a class="dropdown-item" href="/organizations/new" data-ga-click="Header, create new organization">
+    New organization
+  </a>
+
+
+
+  <div class="dropdown-divider"></div>
+  <div class="dropdown-header">
+    <span title="dorimanx/DORIMANX_LG_STOCK_LP_KERNEL">This repository</span>
+  </div>
+    <a class="dropdown-item" href="/dorimanx/DORIMANX_LG_STOCK_LP_KERNEL/issues/new" data-ga-click="Header, create new issue">
+      New issue
+    </a>
+
+      </ul>
+    </div>
+  </li>
+
+  <li class="header-nav-item dropdown js-menu-container">
+    <a class="header-nav-link name tooltipped tooltipped-sw js-menu-target" href="/xDARKMATT3Rx"
+       aria-label="View profile and more"
+       data-ga-click="Header, show menu, icon:avatar">
+      <img alt="@xDARKMATT3Rx" class="avatar" height="20" src="https://avatars3.githubusercontent.com/u/14876718?v=3&amp;s=40" width="20" />
+      <span class="dropdown-caret"></span>
+    </a>
+
+    <div class="dropdown-menu-content js-menu-content">
+      <div class="dropdown-menu dropdown-menu-sw">
+        <div class="dropdown-header header-nav-current-user css-truncate">
+          Signed in as <strong class="css-truncate-target">xDARKMATT3Rx</strong>
+        </div>
+
+        <div class="dropdown-divider"></div>
+
+        <a class="dropdown-item" href="/xDARKMATT3Rx" data-ga-click="Header, go to profile, text:your profile">
+          Your profile
+        </a>
+        <a class="dropdown-item" href="/xDARKMATT3Rx?tab=stars" data-ga-click="Header, go to starred repos, text:your stars">
+          Your stars
+        </a>
+        <a class="dropdown-item" href="/explore" data-ga-click="Header, go to explore, text:explore">
+          Explore
+        </a>
+          <a class="dropdown-item" href="/integrations" data-ga-click="Header, go to integrations, text:integrations">
+            Integrations
+          </a>
+        <a class="dropdown-item" href="https://help.github.com" data-ga-click="Header, go to help, text:help">
+          Help
+        </a>
+
+
+        <div class="dropdown-divider"></div>
+
+        <a class="dropdown-item" href="/settings/profile" data-ga-click="Header, go to settings, icon:settings">
+          Settings
+        </a>
+
+        <!-- '"` --><!-- </textarea></xmp> --></option></form><form accept-charset="UTF-8" action="/logout" class="logout-form" data-form-nonce="f78e7491e9567ee3ea1e9c71e2c0baa11c9ec78d" method="post"><div style="margin:0;padding:0;display:inline"><input name="utf8" type="hidden" value="&#x2713;" /><input name="authenticity_token" type="hidden" value="HPDzP+dM1jO8U+KbweMfM8SKhW/RACCtu+pI5Q0c5il6lyvTGh45+hX36YBTI4hqE1AomAymhrkRAIG51UIypw==" /></div>
+          <button type="submit" class="dropdown-item dropdown-signout" data-ga-click="Header, sign out, icon:logout">
+            Sign out
+          </button>
+</form>      </div>
+    </div>
+  </li>
+</ul>
+
+
+    
+  </div>
+</div>
+
+
+      
+
+
+    <div id="start-of-content" class="accessibility-aid"></div>
+
+      <div id="js-flash-container">
+</div>
+
+
+    <div role="main">
+        <div itemscope itemtype="http://schema.org/SoftwareSourceCode">
+    <div id="js-repo-pjax-container" data-pjax-container>
+      
+<div class="pagehead repohead instapaper_ignore readability-menu experiment-repo-nav">
+  <div class="container repohead-details-container">
+
+    
+
+<ul class="pagehead-actions">
+
+  <li>
+        <!-- '"` --><!-- </textarea></xmp> --></option></form><form accept-charset="UTF-8" action="/notifications/subscribe" class="js-social-container" data-autosubmit="true" data-form-nonce="f78e7491e9567ee3ea1e9c71e2c0baa11c9ec78d" data-remote="true" method="post"><div style="margin:0;padding:0;display:inline"><input name="utf8" type="hidden" value="&#x2713;" /><input name="authenticity_token" type="hidden" value="05DDd4OKYPhE5WZKlINUOs27dW5ec8kKkO0Z7I8lCMqhbIk2o4itxgu6OrbI4vowQP8cNYUKdLcQQ0roC70rRw==" /></div>      <input class="form-control" id="repository_id" name="repository_id" type="hidden" value="33729870" />
+
+        <div class="select-menu js-menu-container js-select-menu">
+          <a href="/dorimanx/DORIMANX_LG_STOCK_LP_KERNEL/subscription"
+            class="btn btn-sm btn-with-count select-menu-button js-menu-target" role="button" tabindex="0" aria-haspopup="true"
+            data-ga-click="Repository, click Watch settings, action:blob#show">
+            <span class="js-select-button">
+              <svg aria-hidden="true" class="octicon octicon-eye" height="16" version="1.1" viewBox="0 0 16 16" width="16"><path d="M8.06 2C3 2 0 8 0 8s3 6 8.06 6C13 14 16 8 16 8s-3-6-7.94-6zM8 12c-2.2 0-4-1.78-4-4 0-2.2 1.8-4 4-4 2.22 0 4 1.8 4 4 0 2.22-1.78 4-4 4zm2-4c0 1.11-.89 2-2 2-1.11 0-2-.89-2-2 0-1.11.89-2 2-2 1.11 0 2 .89 2 2z"></path></svg>
+              Watch
+            </span>
+          </a>
+          <a class="social-count js-social-count"
+            href="/dorimanx/DORIMANX_LG_STOCK_LP_KERNEL/watchers"
+            aria-label="21 users are watching this repository">
+            21
+          </a>
+
+        <div class="select-menu-modal-holder">
+          <div class="select-menu-modal subscription-menu-modal js-menu-content" aria-hidden="true">
+            <div class="select-menu-header js-navigation-enable" tabindex="-1">
+              <svg aria-label="Close" class="octicon octicon-x js-menu-close" height="16" role="img" version="1.1" viewBox="0 0 12 16" width="12"><path d="M7.48 8l3.75 3.75-1.48 1.48L6 9.48l-3.75 3.75-1.48-1.48L4.52 8 .77 4.25l1.48-1.48L6 6.52l3.75-3.75 1.48 1.48z"></path></svg>
+              <span class="select-menu-title">Notifications</span>
+            </div>
+
+              <div class="select-menu-list js-navigation-container" role="menu">
+
+                <div class="select-menu-item js-navigation-item selected" role="menuitem" tabindex="0">
+                  <svg aria-hidden="true" class="octicon octicon-check select-menu-item-icon" height="16" version="1.1" viewBox="0 0 12 16" width="12"><path d="M12 5l-8 8-4-4 1.5-1.5L4 10l6.5-6.5z"></path></svg>
+                  <div class="select-menu-item-text">
+                    <input checked="checked" id="do_included" name="do" type="radio" value="included" />
+                    <span class="select-menu-item-heading">Not watching</span>
+                    <span class="description">Be notified when participating or @mentioned.</span>
+                    <span class="js-select-button-text hidden-select-button-text">
+                      <svg aria-hidden="true" class="octicon octicon-eye" height="16" version="1.1" viewBox="0 0 16 16" width="16"><path d="M8.06 2C3 2 0 8 0 8s3 6 8.06 6C13 14 16 8 16 8s-3-6-7.94-6zM8 12c-2.2 0-4-1.78-4-4 0-2.2 1.8-4 4-4 2.22 0 4 1.8 4 4 0 2.22-1.78 4-4 4zm2-4c0 1.11-.89 2-2 2-1.11 0-2-.89-2-2 0-1.11.89-2 2-2 1.11 0 2 .89 2 2z"></path></svg>
+                      Watch
+                    </span>
+                  </div>
+                </div>
+
+                <div class="select-menu-item js-navigation-item " role="menuitem" tabindex="0">
+                  <svg aria-hidden="true" class="octicon octicon-check select-menu-item-icon" height="16" version="1.1" viewBox="0 0 12 16" width="12"><path d="M12 5l-8 8-4-4 1.5-1.5L4 10l6.5-6.5z"></path></svg>
+                  <div class="select-menu-item-text">
+                    <input id="do_subscribed" name="do" type="radio" value="subscribed" />
+                    <span class="select-menu-item-heading">Watching</span>
+                    <span class="description">Be notified of all conversations.</span>
+                    <span class="js-select-button-text hidden-select-button-text">
+                      <svg aria-hidden="true" class="octicon octicon-eye" height="16" version="1.1" viewBox="0 0 16 16" width="16"><path d="M8.06 2C3 2 0 8 0 8s3 6 8.06 6C13 14 16 8 16 8s-3-6-7.94-6zM8 12c-2.2 0-4-1.78-4-4 0-2.2 1.8-4 4-4 2.22 0 4 1.8 4 4 0 2.22-1.78 4-4 4zm2-4c0 1.11-.89 2-2 2-1.11 0-2-.89-2-2 0-1.11.89-2 2-2 1.11 0 2 .89 2 2z"></path></svg>
+                      Unwatch
+                    </span>
+                  </div>
+                </div>
+
+                <div class="select-menu-item js-navigation-item " role="menuitem" tabindex="0">
+                  <svg aria-hidden="true" class="octicon octicon-check select-menu-item-icon" height="16" version="1.1" viewBox="0 0 12 16" width="12"><path d="M12 5l-8 8-4-4 1.5-1.5L4 10l6.5-6.5z"></path></svg>
+                  <div class="select-menu-item-text">
+                    <input id="do_ignore" name="do" type="radio" value="ignore" />
+                    <span class="select-menu-item-heading">Ignoring</span>
+                    <span class="description">Never be notified.</span>
+                    <span class="js-select-button-text hidden-select-button-text">
+                      <svg aria-hidden="true" class="octicon octicon-mute" height="16" version="1.1" viewBox="0 0 16 16" width="16"><path d="M8 2.81v10.38c0 .67-.81 1-1.28.53L3 10H1c-.55 0-1-.45-1-1V7c0-.55.45-1 1-1h2l3.72-3.72C7.19 1.81 8 2.14 8 2.81zm7.53 3.22l-1.06-1.06-1.97 1.97-1.97-1.97-1.06 1.06L11.44 8 9.47 9.97l1.06 1.06 1.97-1.97 1.97 1.97 1.06-1.06L13.56 8l1.97-1.97z"></path></svg>
+                      Stop ignoring
+                    </span>
+                  </div>
+                </div>
+
+              </div>
+
+            </div>
+          </div>
+        </div>
+</form>
+  </li>
+
+  <li>
+    
+  <div class="js-toggler-container js-social-container starring-container ">
+
+    <!-- '"` --><!-- </textarea></xmp> --></option></form><form accept-charset="UTF-8" action="/dorimanx/DORIMANX_LG_STOCK_LP_KERNEL/unstar" class="starred" data-form-nonce="f78e7491e9567ee3ea1e9c71e2c0baa11c9ec78d" data-remote="true" method="post"><div style="margin:0;padding:0;display:inline"><input name="utf8" type="hidden" value="&#x2713;" /><input name="authenticity_token" type="hidden" value="1X3hhvtRYmr5jxByYF/E7l8/QCZmk6Nv2PtG92mstL9z7paXFcXeNQImHzy616DaSfsmN+XYIHrU/zgTjH9rFw==" /></div>
+      <button
+        type="submit"
+        class="btn btn-sm btn-with-count js-toggler-target"
+        aria-label="Unstar this repository" title="Unstar dorimanx/DORIMANX_LG_STOCK_LP_KERNEL"
+        data-ga-click="Repository, click unstar button, action:blob#show; text:Unstar">
+        <svg aria-hidden="true" class="octicon octicon-star" height="16" version="1.1" viewBox="0 0 14 16" width="14"><path d="M14 6l-4.9-.64L7 1 4.9 5.36 0 6l3.6 3.26L2.67 14 7 11.67 11.33 14l-.93-4.74z"></path></svg>
+        Unstar
+      </button>
+        <a class="social-count js-social-count" href="/dorimanx/DORIMANX_LG_STOCK_LP_KERNEL/stargazers"
+           aria-label="33 users starred this repository">
+          33
+        </a>
+</form>
+    <!-- '"` --><!-- </textarea></xmp> --></option></form><form accept-charset="UTF-8" action="/dorimanx/DORIMANX_LG_STOCK_LP_KERNEL/star" class="unstarred" data-form-nonce="f78e7491e9567ee3ea1e9c71e2c0baa11c9ec78d" data-remote="true" method="post"><div style="margin:0;padding:0;display:inline"><input name="utf8" type="hidden" value="&#x2713;" /><input name="authenticity_token" type="hidden" value="cRexe35Zsd6pjc5Zca0hCPnk8f1NVM4VNCB7+bngAm+AGIpPSCh5KOZS+tUwVzp8/jnelXlSejEsPSP8692iLA==" /></div>
+      <button
+        type="submit"
+        class="btn btn-sm btn-with-count js-toggler-target"
+        aria-label="Star this repository" title="Star dorimanx/DORIMANX_LG_STOCK_LP_KERNEL"
+        data-ga-click="Repository, click star button, action:blob#show; text:Star">
+        <svg aria-hidden="true" class="octicon octicon-star" height="16" version="1.1" viewBox="0 0 14 16" width="14"><path d="M14 6l-4.9-.64L7 1 4.9 5.36 0 6l3.6 3.26L2.67 14 7 11.67 11.33 14l-.93-4.74z"></path></svg>
+        Star
+      </button>
+        <a class="social-count js-social-count" href="/dorimanx/DORIMANX_LG_STOCK_LP_KERNEL/stargazers"
+           aria-label="33 users starred this repository">
+          33
+        </a>
+</form>  </div>
+
+  </li>
+
+  <li>
+          <!-- '"` --><!-- </textarea></xmp> --></option></form><form accept-charset="UTF-8" action="/dorimanx/DORIMANX_LG_STOCK_LP_KERNEL/fork" class="btn-with-count" data-form-nonce="f78e7491e9567ee3ea1e9c71e2c0baa11c9ec78d" method="post"><div style="margin:0;padding:0;display:inline"><input name="utf8" type="hidden" value="&#x2713;" /><input name="authenticity_token" type="hidden" value="58bBMfqWQzlKiCB8BygqA1jFBNT6h6DPo9it9o+PWS41m1N0/Mk6cYA921au68kzBOEDoZdA9iA8iVsuQWZhxw==" /></div>
+            <button
+                type="submit"
+                class="btn btn-sm btn-with-count"
+                data-ga-click="Repository, show fork modal, action:blob#show; text:Fork"
+                title="Fork your own copy of dorimanx/DORIMANX_LG_STOCK_LP_KERNEL to your account"
+                aria-label="Fork your own copy of dorimanx/DORIMANX_LG_STOCK_LP_KERNEL to your account">
+              <svg aria-hidden="true" class="octicon octicon-repo-forked" height="16" version="1.1" viewBox="0 0 10 16" width="10"><path d="M8 1a1.993 1.993 0 0 0-1 3.72V6L5 8 3 6V4.72A1.993 1.993 0 0 0 2 1a1.993 1.993 0 0 0-1 3.72V6.5l3 3v1.78A1.993 1.993 0 0 0 5 15a1.993 1.993 0 0 0 1-3.72V9.5l3-3V4.72A1.993 1.993 0 0 0 8 1zM2 4.2C1.34 4.2.8 3.65.8 3c0-.65.55-1.2 1.2-1.2.65 0 1.2.55 1.2 1.2 0 .65-.55 1.2-1.2 1.2zm3 10c-.66 0-1.2-.55-1.2-1.2 0-.65.55-1.2 1.2-1.2.65 0 1.2.55 1.2 1.2 0 .65-.55 1.2-1.2 1.2zm3-10c-.66 0-1.2-.55-1.2-1.2 0-.65.55-1.2 1.2-1.2.65 0 1.2.55 1.2 1.2 0 .65-.55 1.2-1.2 1.2z"></path></svg>
+              Fork
+            </button>
+</form>
+    <a href="/dorimanx/DORIMANX_LG_STOCK_LP_KERNEL/network" class="social-count"
+       aria-label="18 users are forked this repository">
+      18
+    </a>
+  </li>
+</ul>
+
+    <h1 class="public ">
+  <svg aria-hidden="true" class="octicon octicon-repo" height="16" version="1.1" viewBox="0 0 12 16" width="12"><path d="M4 9H3V8h1v1zm0-3H3v1h1V6zm0-2H3v1h1V4zm0-2H3v1h1V2zm8-1v12c0 .55-.45 1-1 1H6v2l-1.5-1.5L3 16v-2H1c-.55 0-1-.45-1-1V1c0-.55.45-1 1-1h10c.55 0 1 .45 1 1zm-1 10H1v2h2v-1h3v1h5v-2zm0-10H2v9h9V1z"></path></svg>
+  <span class="author" itemprop="author"><a href="/dorimanx" class="url fn" rel="author">dorimanx</a></span><!--
+--><span class="path-divider">/</span><!--
+--><strong itemprop="name"><a href="/dorimanx/DORIMANX_LG_STOCK_LP_KERNEL" data-pjax="#js-repo-pjax-container">DORIMANX_LG_STOCK_LP_KERNEL</a></strong>
+
+</h1>
+
+  </div>
+  <div class="container">
+    
+<nav class="reponav js-repo-nav js-sidenav-container-pjax"
+     itemscope
+     itemtype="http://schema.org/BreadcrumbList"
+     role="navigation"
+     data-pjax="#js-repo-pjax-container">
+
+  <span itemscope itemtype="http://schema.org/ListItem" itemprop="itemListElement">
+    <a href="/dorimanx/DORIMANX_LG_STOCK_LP_KERNEL" aria-selected="true" class="js-selected-navigation-item selected reponav-item" data-hotkey="g c" data-selected-links="repo_source repo_downloads repo_commits repo_releases repo_tags repo_branches /dorimanx/DORIMANX_LG_STOCK_LP_KERNEL" itemprop="url">
+      <svg aria-hidden="true" class="octicon octicon-code" height="16" version="1.1" viewBox="0 0 14 16" width="14"><path d="M9.5 3L8 4.5 11.5 8 8 11.5 9.5 13 14 8 9.5 3zm-5 0L0 8l4.5 5L6 11.5 2.5 8 6 4.5 4.5 3z"></path></svg>
+      <span itemprop="name">Code</span>
+      <meta itemprop="position" content="1">
+</a>  </span>
+
+    <span itemscope itemtype="http://schema.org/ListItem" itemprop="itemListElement">
+      <a href="/dorimanx/DORIMANX_LG_STOCK_LP_KERNEL/issues" class="js-selected-navigation-item reponav-item" data-hotkey="g i" data-selected-links="repo_issues repo_labels repo_milestones /dorimanx/DORIMANX_LG_STOCK_LP_KERNEL/issues" itemprop="url">
+        <svg aria-hidden="true" class="octicon octicon-issue-opened" height="16" version="1.1" viewBox="0 0 14 16" width="14"><path d="M7 2.3c3.14 0 5.7 2.56 5.7 5.7s-2.56 5.7-5.7 5.7A5.71 5.71 0 0 1 1.3 8c0-3.14 2.56-5.7 5.7-5.7zM7 1C3.14 1 0 4.14 0 8s3.14 7 7 7 7-3.14 7-7-3.14-7-7-7zm1 3H6v5h2V4zm0 6H6v2h2v-2z"></path></svg>
+        <span itemprop="name">Issues</span>
+        <span class="counter">0</span>
+        <meta itemprop="position" content="2">
+</a>    </span>
+
+  <span itemscope itemtype="http://schema.org/ListItem" itemprop="itemListElement">
+    <a href="/dorimanx/DORIMANX_LG_STOCK_LP_KERNEL/pulls" class="js-selected-navigation-item reponav-item" data-hotkey="g p" data-selected-links="repo_pulls /dorimanx/DORIMANX_LG_STOCK_LP_KERNEL/pulls" itemprop="url">
+      <svg aria-hidden="true" class="octicon octicon-git-pull-request" height="16" version="1.1" viewBox="0 0 12 16" width="12"><path d="M11 11.28V5c-.03-.78-.34-1.47-.94-2.06C9.46 2.35 8.78 2.03 8 2H7V0L4 3l3 3V4h1c.27.02.48.11.69.31.21.2.3.42.31.69v6.28A1.993 1.993 0 0 0 10 15a1.993 1.993 0 0 0 1-3.72zm-1 2.92c-.66 0-1.2-.55-1.2-1.2 0-.65.55-1.2 1.2-1.2.65 0 1.2.55 1.2 1.2 0 .65-.55 1.2-1.2 1.2zM4 3c0-1.11-.89-2-2-2a1.993 1.993 0 0 0-1 3.72v6.56A1.993 1.993 0 0 0 2 15a1.993 1.993 0 0 0 1-3.72V4.72c.59-.34 1-.98 1-1.72zm-.8 10c0 .66-.55 1.2-1.2 1.2-.65 0-1.2-.55-1.2-1.2 0-.65.55-1.2 1.2-1.2.65 0 1.2.55 1.2 1.2zM2 4.2C1.34 4.2.8 3.65.8 3c0-.65.55-1.2 1.2-1.2.65 0 1.2.55 1.2 1.2 0 .65-.55 1.2-1.2 1.2z"></path></svg>
+      <span itemprop="name">Pull requests</span>
+      <span class="counter">0</span>
+      <meta itemprop="position" content="3">
+</a>  </span>
+
+  <a href="/dorimanx/DORIMANX_LG_STOCK_LP_KERNEL/projects" class="js-selected-navigation-item reponav-item" data-selected-links="repo_projects new_repo_project repo_project /dorimanx/DORIMANX_LG_STOCK_LP_KERNEL/projects">
+    <svg class="octicon" aria-hidden="true" version="1.1" width="15" height="16" viewBox="0 0 15 16">
+      <path d="M1 15h13V1H1v14zM15 1v14a1 1 0 0 1-1 1H1a1 1 0 0 1-1-1V1a1 1 0 0 1 1-1h13a1 1 0 0 1 1 1zm-4.41 11h1.82c.59 0 .59-.41.59-1V3c0-.59 0-1-.59-1h-1.82C10 2 10 2.41 10 3v8c0 .59 0 1 .59 1zm-4-2h1.82C9 10 9 9.59 9 9V3c0-.59 0-1-.59-1H6.59C6 2 6 2.41 6 3v6c0 .59 0 1 .59 1zM2 13V3c0-.59 0-1 .59-1h1.82C5 2 5 2.41 5 3v10c0 .59 0 1-.59 1H2.59C2 14 2 13.59 2 13z"></path>
+    </svg>
+    Projects
+    <span class="counter">0</span>
+</a>
+    <a href="/dorimanx/DORIMANX_LG_STOCK_LP_KERNEL/wiki" class="js-selected-navigation-item reponav-item" data-hotkey="g w" data-selected-links="repo_wiki /dorimanx/DORIMANX_LG_STOCK_LP_KERNEL/wiki">
+      <svg aria-hidden="true" class="octicon octicon-book" height="16" version="1.1" viewBox="0 0 16 16" width="16"><path d="M3 5h4v1H3V5zm0 3h4V7H3v1zm0 2h4V9H3v1zm11-5h-4v1h4V5zm0 2h-4v1h4V7zm0 2h-4v1h4V9zm2-6v9c0 .55-.45 1-1 1H9.5l-1 1-1-1H2c-.55 0-1-.45-1-1V3c0-.55.45-1 1-1h5.5l1 1 1-1H15c.55 0 1 .45 1 1zm-8 .5L7.5 3H2v9h6V3.5zm7-.5H9.5l-.5.5V12h6V3z"></path></svg>
+      Wiki
+</a>
+
+  <a href="/dorimanx/DORIMANX_LG_STOCK_LP_KERNEL/pulse" class="js-selected-navigation-item reponav-item" data-selected-links="pulse /dorimanx/DORIMANX_LG_STOCK_LP_KERNEL/pulse">
+    <svg aria-hidden="true" class="octicon octicon-pulse" height="16" version="1.1" viewBox="0 0 14 16" width="14"><path d="M11.5 8L8.8 5.4 6.6 8.5 5.5 1.6 2.38 8H0v2h3.6l.9-1.8.9 5.4L9 8.5l1.6 1.5H14V8z"></path></svg>
+    Pulse
+</a>
+  <a href="/dorimanx/DORIMANX_LG_STOCK_LP_KERNEL/graphs" class="js-selected-navigation-item reponav-item" data-selected-links="repo_graphs repo_contributors /dorimanx/DORIMANX_LG_STOCK_LP_KERNEL/graphs">
+    <svg aria-hidden="true" class="octicon octicon-graph" height="16" version="1.1" viewBox="0 0 16 16" width="16"><path d="M16 14v1H0V0h1v14h15zM5 13H3V8h2v5zm4 0H7V3h2v10zm4 0h-2V6h2v7z"></path></svg>
+    Graphs
+</a>
+
+</nav>
+
+  </div>
+</div>
+
+<div class="container new-discussion-timeline experiment-repo-nav">
+  <div class="repository-content">
+
+    
+
+<a href="/dorimanx/DORIMANX_LG_STOCK_LP_KERNEL/blob/7c18f14f9a9dc5ec18bec319f8d1f81ff5be2cae/drivers/cpufreq/cpufreq_intellidemand.c" class="d-none js-permalink-shortcut" data-hotkey="y">Permalink</a>
+
+<!-- blob contrib key: blob_contributors:v21:076e0c723ef9a52850d99b44a8765213 -->
+
+<div class="file-navigation js-zeroclipboard-container">
+  
+<div class="select-menu branch-select-menu js-menu-container js-select-menu float-left">
+  <button class="btn btn-sm select-menu-button js-menu-target css-truncate" data-hotkey="w"
+    
+    type="button" aria-label="Switch branches or tags" tabindex="0" aria-haspopup="true">
+    <i>Branch:</i>
+    <span class="js-select-button css-truncate-target">master</span>
+  </button>
+
+  <div class="select-menu-modal-holder js-menu-content js-navigation-container" data-pjax aria-hidden="true">
+
+    <div class="select-menu-modal">
+      <div class="select-menu-header">
+        <svg aria-label="Close" class="octicon octicon-x js-menu-close" height="16" role="img" version="1.1" viewBox="0 0 12 16" width="12"><path d="M7.48 8l3.75 3.75-1.48 1.48L6 9.48l-3.75 3.75-1.48-1.48L4.52 8 .77 4.25l1.48-1.48L6 6.52l3.75-3.75 1.48 1.48z"></path></svg>
+        <span class="select-menu-title">Switch branches/tags</span>
+      </div>
+
+      <div class="select-menu-filters">
+        <div class="select-menu-text-filter">
+          <input type="text" aria-label="Filter branches/tags" id="context-commitish-filter-field" class="form-control js-filterable-field js-navigation-enable" placeholder="Filter branches/tags">
+        </div>
+        <div class="select-menu-tabs">
+          <ul>
+            <li class="select-menu-tab">
+              <a href="#" data-tab-filter="branches" data-filter-placeholder="Filter branches/tags" class="js-select-menu-tab" role="tab">Branches</a>
+            </li>
+            <li class="select-menu-tab">
+              <a href="#" data-tab-filter="tags" data-filter-placeholder="Find a tag…" class="js-select-menu-tab" role="tab">Tags</a>
+            </li>
+          </ul>
+        </div>
+      </div>
+
+      <div class="select-menu-list select-menu-tab-bucket js-select-menu-tab-bucket" data-tab-filter="branches" role="menu">
+
+        <div data-filterable-for="context-commitish-filter-field" data-filterable-type="substring">
+
+
+            <a class="select-menu-item js-navigation-item js-navigation-open "
+               href="/dorimanx/DORIMANX_LG_STOCK_LP_KERNEL/blob/3.10.y-CM13/drivers/cpufreq/cpufreq_intellidemand.c"
+               data-name="3.10.y-CM13"
+               data-skip-pjax="true"
+               rel="nofollow">
+              <svg aria-hidden="true" class="octicon octicon-check select-menu-item-icon" height="16" version="1.1" viewBox="0 0 12 16" width="12"><path d="M12 5l-8 8-4-4 1.5-1.5L4 10l6.5-6.5z"></path></svg>
+              <span class="select-menu-item-text css-truncate-target js-select-menu-filter-text">
+                3.10.y-CM13
+              </span>
+            </a>
+            <a class="select-menu-item js-navigation-item js-navigation-open "
+               href="/dorimanx/DORIMANX_LG_STOCK_LP_KERNEL/blob/D800/drivers/cpufreq/cpufreq_intellidemand.c"
+               data-name="D800"
+               data-skip-pjax="true"
+               rel="nofollow">
+              <svg aria-hidden="true" class="octicon octicon-check select-menu-item-icon" height="16" version="1.1" viewBox="0 0 12 16" width="12"><path d="M12 5l-8 8-4-4 1.5-1.5L4 10l6.5-6.5z"></path></svg>
+              <span class="select-menu-item-text css-truncate-target js-select-menu-filter-text">
+                D800
+              </span>
+            </a>
+            <a class="select-menu-item js-navigation-item js-navigation-open "
+               href="/dorimanx/DORIMANX_LG_STOCK_LP_KERNEL/blob/D801/drivers/cpufreq/cpufreq_intellidemand.c"
+               data-name="D801"
+               data-skip-pjax="true"
+               rel="nofollow">
+              <svg aria-hidden="true" class="octicon octicon-check select-menu-item-icon" height="16" version="1.1" viewBox="0 0 12 16" width="12"><path d="M12 5l-8 8-4-4 1.5-1.5L4 10l6.5-6.5z"></path></svg>
+              <span class="select-menu-item-text css-truncate-target js-select-menu-filter-text">
+                D801
+              </span>
+            </a>
+            <a class="select-menu-item js-navigation-item js-navigation-open "
+               href="/dorimanx/DORIMANX_LG_STOCK_LP_KERNEL/blob/LP-D802/drivers/cpufreq/cpufreq_intellidemand.c"
+               data-name="LP-D802"
+               data-skip-pjax="true"
+               rel="nofollow">
+              <svg aria-hidden="true" class="octicon octicon-check select-menu-item-icon" height="16" version="1.1" viewBox="0 0 12 16" width="12"><path d="M12 5l-8 8-4-4 1.5-1.5L4 10l6.5-6.5z"></path></svg>
+              <span class="select-menu-item-text css-truncate-target js-select-menu-filter-text">
+                LP-D802
+              </span>
+            </a>
+            <a class="select-menu-item js-navigation-item js-navigation-open "
+               href="/dorimanx/DORIMANX_LG_STOCK_LP_KERNEL/blob/LP-F320/drivers/cpufreq/cpufreq_intellidemand.c"
+               data-name="LP-F320"
+               data-skip-pjax="true"
+               rel="nofollow">
+              <svg aria-hidden="true" class="octicon octicon-check select-menu-item-icon" height="16" version="1.1" viewBox="0 0 12 16" width="12"><path d="M12 5l-8 8-4-4 1.5-1.5L4 10l6.5-6.5z"></path></svg>
+              <span class="select-menu-item-text css-truncate-target js-select-menu-filter-text">
+                LP-F320
+              </span>
+            </a>
+            <a class="select-menu-item js-navigation-item js-navigation-open "
+               href="/dorimanx/DORIMANX_LG_STOCK_LP_KERNEL/blob/LS980/drivers/cpufreq/cpufreq_intellidemand.c"
+               data-name="LS980"
+               data-skip-pjax="true"
+               rel="nofollow">
+              <svg aria-hidden="true" class="octicon octicon-check select-menu-item-icon" height="16" version="1.1" viewBox="0 0 12 16" width="12"><path d="M12 5l-8 8-4-4 1.5-1.5L4 10l6.5-6.5z"></path></svg>
+              <span class="select-menu-item-text css-truncate-target js-select-menu-filter-text">
+                LS980
+              </span>
+            </a>
+            <a class="select-menu-item js-navigation-item js-navigation-open "
+               href="/dorimanx/DORIMANX_LG_STOCK_LP_KERNEL/blob/VS980/drivers/cpufreq/cpufreq_intellidemand.c"
+               data-name="VS980"
+               data-skip-pjax="true"
+               rel="nofollow">
+              <svg aria-hidden="true" class="octicon octicon-check select-menu-item-icon" height="16" version="1.1" viewBox="0 0 12 16" width="12"><path d="M12 5l-8 8-4-4 1.5-1.5L4 10l6.5-6.5z"></path></svg>
+              <span class="select-menu-item-text css-truncate-target js-select-menu-filter-text">
+                VS980
+              </span>
+            </a>
+            <a class="select-menu-item js-navigation-item js-navigation-open "
+               href="/dorimanx/DORIMANX_LG_STOCK_LP_KERNEL/blob/dev-arch-mm-broken/drivers/cpufreq/cpufreq_intellidemand.c"
+               data-name="dev-arch-mm-broken"
+               data-skip-pjax="true"
+               rel="nofollow">
+              <svg aria-hidden="true" class="octicon octicon-check select-menu-item-icon" height="16" version="1.1" viewBox="0 0 12 16" width="12"><path d="M12 5l-8 8-4-4 1.5-1.5L4 10l6.5-6.5z"></path></svg>
+              <span class="select-menu-item-text css-truncate-target js-select-menu-filter-text">
+                dev-arch-mm-broken
+              </span>
+            </a>
+            <a class="select-menu-item js-navigation-item js-navigation-open "
+               href="/dorimanx/DORIMANX_LG_STOCK_LP_KERNEL/blob/dev-mm-api-fix/drivers/cpufreq/cpufreq_intellidemand.c"
+               data-name="dev-mm-api-fix"
+               data-skip-pjax="true"
+               rel="nofollow">
+              <svg aria-hidden="true" class="octicon octicon-check select-menu-item-icon" height="16" version="1.1" viewBox="0 0 12 16" width="12"><path d="M12 5l-8 8-4-4 1.5-1.5L4 10l6.5-6.5z"></path></svg>
+              <span class="select-menu-item-text css-truncate-target js-select-menu-filter-text">
+                dev-mm-api-fix
+              </span>
+            </a>
+            <a class="select-menu-item js-navigation-item js-navigation-open "
+               href="/dorimanx/DORIMANX_LG_STOCK_LP_KERNEL/blob/dev-shrink-api/drivers/cpufreq/cpufreq_intellidemand.c"
+               data-name="dev-shrink-api"
+               data-skip-pjax="true"
+               rel="nofollow">
+              <svg aria-hidden="true" class="octicon octicon-check select-menu-item-icon" height="16" version="1.1" viewBox="0 0 12 16" width="12"><path d="M12 5l-8 8-4-4 1.5-1.5L4 10l6.5-6.5z"></path></svg>
+              <span class="select-menu-item-text css-truncate-target js-select-menu-filter-text">
+                dev-shrink-api
+              </span>
+            </a>
+            <a class="select-menu-item js-navigation-item js-navigation-open "
+               href="/dorimanx/DORIMANX_LG_STOCK_LP_KERNEL/blob/f2fs-3.18.y/drivers/cpufreq/cpufreq_intellidemand.c"
+               data-name="f2fs-3.18.y"
+               data-skip-pjax="true"
+               rel="nofollow">
+              <svg aria-hidden="true" class="octicon octicon-check select-menu-item-icon" height="16" version="1.1" viewBox="0 0 12 16" width="12"><path d="M12 5l-8 8-4-4 1.5-1.5L4 10l6.5-6.5z"></path></svg>
+              <span class="select-menu-item-text css-truncate-target js-select-menu-filter-text">
+                f2fs-3.18.y
+              </span>
+            </a>
+            <a class="select-menu-item js-navigation-item js-navigation-open "
+               href="/dorimanx/DORIMANX_LG_STOCK_LP_KERNEL/blob/f2fs-4.x.y/drivers/cpufreq/cpufreq_intellidemand.c"
+               data-name="f2fs-4.x.y"
+               data-skip-pjax="true"
+               rel="nofollow">
+              <svg aria-hidden="true" class="octicon octicon-check select-menu-item-icon" height="16" version="1.1" viewBox="0 0 12 16" width="12"><path d="M12 5l-8 8-4-4 1.5-1.5L4 10l6.5-6.5z"></path></svg>
+              <span class="select-menu-item-text css-truncate-target js-select-menu-filter-text">
+                f2fs-4.x.y
+              </span>
+            </a>
+            <a class="select-menu-item js-navigation-item js-navigation-open selected"
+               href="/dorimanx/DORIMANX_LG_STOCK_LP_KERNEL/blob/master/drivers/cpufreq/cpufreq_intellidemand.c"
+               data-name="master"
+               data-skip-pjax="true"
+               rel="nofollow">
+              <svg aria-hidden="true" class="octicon octicon-check select-menu-item-icon" height="16" version="1.1" viewBox="0 0 12 16" width="12"><path d="M12 5l-8 8-4-4 1.5-1.5L4 10l6.5-6.5z"></path></svg>
+              <span class="select-menu-item-text css-truncate-target js-select-menu-filter-text">
+                master
+              </span>
+            </a>
+        </div>
+
+          <div class="select-menu-no-results">Nothing to show</div>
+      </div>
+
+      <div class="select-menu-list select-menu-tab-bucket js-select-menu-tab-bucket" data-tab-filter="tags">
+        <div data-filterable-for="context-commitish-filter-field" data-filterable-type="substring">
+
+
+            <a class="select-menu-item js-navigation-item js-navigation-open "
+              href="/dorimanx/DORIMANX_LG_STOCK_LP_KERNEL/tree/4.7.3/drivers/cpufreq/cpufreq_intellidemand.c"
+              data-name="4.7.3"
+              data-skip-pjax="true"
+              rel="nofollow">
+              <svg aria-hidden="true" class="octicon octicon-check select-menu-item-icon" height="16" version="1.1" viewBox="0 0 12 16" width="12"><path d="M12 5l-8 8-4-4 1.5-1.5L4 10l6.5-6.5z"></path></svg>
+              <span class="select-menu-item-text css-truncate-target" title="4.7.3">
+                4.7.3
+              </span>
+            </a>
+            <a class="select-menu-item js-navigation-item js-navigation-open "
+              href="/dorimanx/DORIMANX_LG_STOCK_LP_KERNEL/tree/4.7.2/drivers/cpufreq/cpufreq_intellidemand.c"
+              data-name="4.7.2"
+              data-skip-pjax="true"
+              rel="nofollow">
+              <svg aria-hidden="true" class="octicon octicon-check select-menu-item-icon" height="16" version="1.1" viewBox="0 0 12 16" width="12"><path d="M12 5l-8 8-4-4 1.5-1.5L4 10l6.5-6.5z"></path></svg>
+              <span class="select-menu-item-text css-truncate-target" title="4.7.2">
+                4.7.2
+              </span>
+            </a>
+        </div>
+
+        <div class="select-menu-no-results">Nothing to show</div>
+      </div>
+
+    </div>
+  </div>
+</div>
+
+  <div class="BtnGroup float-right">
+    <a href="/dorimanx/DORIMANX_LG_STOCK_LP_KERNEL/find/master"
+          class="js-pjax-capture-input btn btn-sm BtnGroup-item"
+          data-pjax
+          data-hotkey="t">
+      Find file
+    </a>
+    <button aria-label="Copy file path to clipboard" class="js-zeroclipboard btn btn-sm BtnGroup-item tooltipped tooltipped-s" data-copied-hint="Copied!" type="button">Copy path</button>
+  </div>
+  <div class="breadcrumb js-zeroclipboard-target">
+    <span class="repo-root js-repo-root"><span class="js-path-segment"><a href="/dorimanx/DORIMANX_LG_STOCK_LP_KERNEL"><span>DORIMANX_LG_STOCK_LP_KERNEL</span></a></span></span><span class="separator">/</span><span class="js-path-segment"><a href="/dorimanx/DORIMANX_LG_STOCK_LP_KERNEL/tree/master/drivers"><span>drivers</span></a></span><span class="separator">/</span><span class="js-path-segment"><a href="/dorimanx/DORIMANX_LG_STOCK_LP_KERNEL/tree/master/drivers/cpufreq"><span>cpufreq</span></a></span><span class="separator">/</span><strong class="final-path">cpufreq_intellidemand.c</strong>
+  </div>
+</div>
+
+<include-fragment class="commit-tease" src="/dorimanx/DORIMANX_LG_STOCK_LP_KERNEL/contributors/master/drivers/cpufreq/cpufreq_intellidemand.c">
+  <div>
+    Fetching contributors&hellip;
+  </div>
+
+  <div class="commit-tease-contributors">
+    <img alt="" class="loader-loading float-left" height="16" src="https://assets-cdn.github.com/images/spinners/octocat-spinner-32-EAF2F5.gif" width="16" />
+    <span class="loader-error">Cannot retrieve contributors at this time</span>
+  </div>
+</include-fragment>
+<div class="file">
+  <div class="file-header">
+  <div class="file-actions">
+
+    <div class="BtnGroup">
+      <a href="/dorimanx/DORIMANX_LG_STOCK_LP_KERNEL/raw/master/drivers/cpufreq/cpufreq_intellidemand.c" class="btn btn-sm BtnGroup-item" id="raw-url">Raw</a>
+        <a href="/dorimanx/DORIMANX_LG_STOCK_LP_KERNEL/blame/master/drivers/cpufreq/cpufreq_intellidemand.c" class="btn btn-sm js-update-url-with-hash BtnGroup-item">Blame</a>
+      <a href="/dorimanx/DORIMANX_LG_STOCK_LP_KERNEL/commits/master/drivers/cpufreq/cpufreq_intellidemand.c" class="btn btn-sm BtnGroup-item" rel="nofollow">History</a>
+    </div>
+
+
+        <!-- '"` --><!-- </textarea></xmp> --></option></form><form accept-charset="UTF-8" action="/dorimanx/DORIMANX_LG_STOCK_LP_KERNEL/edit/master/drivers/cpufreq/cpufreq_intellidemand.c" class="inline-form js-update-url-with-hash" data-form-nonce="f78e7491e9567ee3ea1e9c71e2c0baa11c9ec78d" method="post"><div style="margin:0;padding:0;display:inline"><input name="utf8" type="hidden" value="&#x2713;" /><input name="authenticity_token" type="hidden" value="2AmR/Luh/hwJhfvVHKyL+vvaEUv1idHKYjObpuQ8w7pSE1YPjpkwZSyG+rup69zHueBpYiBL91Yz9b5cSdYt3Q==" /></div>
+          <button class="btn-octicon tooltipped tooltipped-nw" type="submit"
+            aria-label="Fork this project and edit the file" data-hotkey="e" data-disable-with>
+            <svg aria-hidden="true" class="octicon octicon-pencil" height="16" version="1.1" viewBox="0 0 14 16" width="14"><path d="M0 12v3h3l8-8-3-3-8 8zm3 2H1v-2h1v1h1v1zm10.3-9.3L12 6 9 3l1.3-1.3a.996.996 0 0 1 1.41 0l1.59 1.59c.39.39.39 1.02 0 1.41z"></path></svg>
+          </button>
+</form>        <!-- '"` --><!-- </textarea></xmp> --></option></form><form accept-charset="UTF-8" action="/dorimanx/DORIMANX_LG_STOCK_LP_KERNEL/delete/master/drivers/cpufreq/cpufreq_intellidemand.c" class="inline-form" data-form-nonce="f78e7491e9567ee3ea1e9c71e2c0baa11c9ec78d" method="post"><div style="margin:0;padding:0;display:inline"><input name="utf8" type="hidden" value="&#x2713;" /><input name="authenticity_token" type="hidden" value="oMQzHVtKsFWfMIusasAS0NFfHaC8zXQnBwAwjC4AaCUsg2/ktfBCmA8gSqhSaOTPUMyEcoLdLe+zT/Bv84HClw==" /></div>
+          <button class="btn-octicon btn-octicon-danger tooltipped tooltipped-nw" type="submit"
+            aria-label="Fork this project and delete the file" data-disable-with>
+            <svg aria-hidden="true" class="octicon octicon-trashcan" height="16" version="1.1" viewBox="0 0 12 16" width="12"><path d="M11 2H9c0-.55-.45-1-1-1H5c-.55 0-1 .45-1 1H2c-.55 0-1 .45-1 1v1c0 .55.45 1 1 1v9c0 .55.45 1 1 1h7c.55 0 1-.45 1-1V5c.55 0 1-.45 1-1V3c0-.55-.45-1-1-1zm-1 12H3V5h1v8h1V5h1v8h1V5h1v8h1V5h1v9zm1-10H2V3h9v1z"></path></svg>
+          </button>
+</form>  </div>
+
+  <div class="file-info">
+      1406 lines (1187 sloc)
+      <span class="file-info-divider"></span>
+    36.9 KB
+  </div>
+</div>
+
+  
+
+  <div itemprop="text" class="blob-wrapper data type-c">
+      <table class="highlight tab-size js-file-line-container" data-tab-size="8">
+      <tr>
+        <td id="L1" class="blob-num js-line-number" data-line-number="1"></td>
+        <td id="LC1" class="blob-code blob-code-inner js-file-line"><span class="pl-c">/*</span></td>
+      </tr>
+      <tr>
+        <td id="L2" class="blob-num js-line-number" data-line-number="2"></td>
+        <td id="LC2" class="blob-code blob-code-inner js-file-line"><span class="pl-c"> *  drivers/cpufreq/cpufreq_intellidemand.c</span></td>
+      </tr>
+      <tr>
+        <td id="L3" class="blob-num js-line-number" data-line-number="3"></td>
+        <td id="LC3" class="blob-code blob-code-inner js-file-line"><span class="pl-c"> *</span></td>
+      </tr>
+      <tr>
+        <td id="L4" class="blob-num js-line-number" data-line-number="4"></td>
+        <td id="LC4" class="blob-code blob-code-inner js-file-line"><span class="pl-c"> *  Copyright (C)  2001 Russell King</span></td>
+      </tr>
+      <tr>
+        <td id="L5" class="blob-num js-line-number" data-line-number="5"></td>
+        <td id="LC5" class="blob-code blob-code-inner js-file-line"><span class="pl-c"> *            (C)  2003 Venkatesh Pallipadi &lt;venkatesh.pallipadi@intel.com&gt;.</span></td>
+      </tr>
+      <tr>
+        <td id="L6" class="blob-num js-line-number" data-line-number="6"></td>
+        <td id="LC6" class="blob-code blob-code-inner js-file-line"><span class="pl-c"> *                      Jun Nakajima &lt;jun.nakajima@intel.com&gt;</span></td>
+      </tr>
+      <tr>
+        <td id="L7" class="blob-num js-line-number" data-line-number="7"></td>
+        <td id="LC7" class="blob-code blob-code-inner js-file-line"><span class="pl-c"> *            (C)  2013 The Linux Foundation. All rights reserved.</span></td>
+      </tr>
+      <tr>
+        <td id="L8" class="blob-num js-line-number" data-line-number="8"></td>
+        <td id="LC8" class="blob-code blob-code-inner js-file-line"><span class="pl-c"> *            (C)  2013 Paul Reioux</span></td>
+      </tr>
+      <tr>
+        <td id="L9" class="blob-num js-line-number" data-line-number="9"></td>
+        <td id="LC9" class="blob-code blob-code-inner js-file-line"><span class="pl-c"> *</span></td>
+      </tr>
+      <tr>
+        <td id="L10" class="blob-num js-line-number" data-line-number="10"></td>
+        <td id="LC10" class="blob-code blob-code-inner js-file-line"><span class="pl-c"> * This program is free software; you can redistribute it and/or modify</span></td>
+      </tr>
+      <tr>
+        <td id="L11" class="blob-num js-line-number" data-line-number="11"></td>
+        <td id="LC11" class="blob-code blob-code-inner js-file-line"><span class="pl-c"> * it under the terms of the GNU General Public License version 2 as</span></td>
+      </tr>
+      <tr>
+        <td id="L12" class="blob-num js-line-number" data-line-number="12"></td>
+        <td id="LC12" class="blob-code blob-code-inner js-file-line"><span class="pl-c"> * published by the Free Software Foundation.</span></td>
+      </tr>
+      <tr>
+        <td id="L13" class="blob-num js-line-number" data-line-number="13"></td>
+        <td id="LC13" class="blob-code blob-code-inner js-file-line"><span class="pl-c"> */</span></td>
+      </tr>
+      <tr>
+        <td id="L14" class="blob-num js-line-number" data-line-number="14"></td>
+        <td id="LC14" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L15" class="blob-num js-line-number" data-line-number="15"></td>
+        <td id="LC15" class="blob-code blob-code-inner js-file-line">#<span class="pl-k">include</span> <span class="pl-s"><span class="pl-pds">&lt;</span>linux/kernel.h<span class="pl-pds">&gt;</span></span></td>
+      </tr>
+      <tr>
+        <td id="L16" class="blob-num js-line-number" data-line-number="16"></td>
+        <td id="LC16" class="blob-code blob-code-inner js-file-line">#<span class="pl-k">include</span> <span class="pl-s"><span class="pl-pds">&lt;</span>linux/module.h<span class="pl-pds">&gt;</span></span></td>
+      </tr>
+      <tr>
+        <td id="L17" class="blob-num js-line-number" data-line-number="17"></td>
+        <td id="LC17" class="blob-code blob-code-inner js-file-line">#<span class="pl-k">include</span> <span class="pl-s"><span class="pl-pds">&lt;</span>linux/init.h<span class="pl-pds">&gt;</span></span></td>
+      </tr>
+      <tr>
+        <td id="L18" class="blob-num js-line-number" data-line-number="18"></td>
+        <td id="LC18" class="blob-code blob-code-inner js-file-line">#<span class="pl-k">include</span> <span class="pl-s"><span class="pl-pds">&lt;</span>linux/cpufreq.h<span class="pl-pds">&gt;</span></span></td>
+      </tr>
+      <tr>
+        <td id="L19" class="blob-num js-line-number" data-line-number="19"></td>
+        <td id="LC19" class="blob-code blob-code-inner js-file-line">#<span class="pl-k">include</span> <span class="pl-s"><span class="pl-pds">&lt;</span>linux/cpu.h<span class="pl-pds">&gt;</span></span></td>
+      </tr>
+      <tr>
+        <td id="L20" class="blob-num js-line-number" data-line-number="20"></td>
+        <td id="LC20" class="blob-code blob-code-inner js-file-line">#<span class="pl-k">include</span> <span class="pl-s"><span class="pl-pds">&lt;</span>linux/jiffies.h<span class="pl-pds">&gt;</span></span></td>
+      </tr>
+      <tr>
+        <td id="L21" class="blob-num js-line-number" data-line-number="21"></td>
+        <td id="LC21" class="blob-code blob-code-inner js-file-line">#<span class="pl-k">include</span> <span class="pl-s"><span class="pl-pds">&lt;</span>linux/kernel_stat.h<span class="pl-pds">&gt;</span></span></td>
+      </tr>
+      <tr>
+        <td id="L22" class="blob-num js-line-number" data-line-number="22"></td>
+        <td id="LC22" class="blob-code blob-code-inner js-file-line">#<span class="pl-k">include</span> <span class="pl-s"><span class="pl-pds">&lt;</span>linux/mutex.h<span class="pl-pds">&gt;</span></span></td>
+      </tr>
+      <tr>
+        <td id="L23" class="blob-num js-line-number" data-line-number="23"></td>
+        <td id="LC23" class="blob-code blob-code-inner js-file-line">#<span class="pl-k">include</span> <span class="pl-s"><span class="pl-pds">&lt;</span>linux/hrtimer.h<span class="pl-pds">&gt;</span></span></td>
+      </tr>
+      <tr>
+        <td id="L24" class="blob-num js-line-number" data-line-number="24"></td>
+        <td id="LC24" class="blob-code blob-code-inner js-file-line">#<span class="pl-k">include</span> <span class="pl-s"><span class="pl-pds">&lt;</span>linux/tick.h<span class="pl-pds">&gt;</span></span></td>
+      </tr>
+      <tr>
+        <td id="L25" class="blob-num js-line-number" data-line-number="25"></td>
+        <td id="LC25" class="blob-code blob-code-inner js-file-line">#<span class="pl-k">include</span> <span class="pl-s"><span class="pl-pds">&lt;</span>linux/ktime.h<span class="pl-pds">&gt;</span></span></td>
+      </tr>
+      <tr>
+        <td id="L26" class="blob-num js-line-number" data-line-number="26"></td>
+        <td id="LC26" class="blob-code blob-code-inner js-file-line">#<span class="pl-k">include</span> <span class="pl-s"><span class="pl-pds">&lt;</span>linux/sched.h<span class="pl-pds">&gt;</span></span></td>
+      </tr>
+      <tr>
+        <td id="L27" class="blob-num js-line-number" data-line-number="27"></td>
+        <td id="LC27" class="blob-code blob-code-inner js-file-line">#<span class="pl-k">include</span> <span class="pl-s"><span class="pl-pds">&lt;</span>linux/workqueue.h<span class="pl-pds">&gt;</span></span></td>
+      </tr>
+      <tr>
+        <td id="L28" class="blob-num js-line-number" data-line-number="28"></td>
+        <td id="LC28" class="blob-code blob-code-inner js-file-line">#<span class="pl-k">include</span> <span class="pl-s"><span class="pl-pds">&lt;</span>linux/slab.h<span class="pl-pds">&gt;</span></span></td>
+      </tr>
+      <tr>
+        <td id="L29" class="blob-num js-line-number" data-line-number="29"></td>
+        <td id="LC29" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L30" class="blob-num js-line-number" data-line-number="30"></td>
+        <td id="LC30" class="blob-code blob-code-inner js-file-line">#<span class="pl-k">define</span> <span class="pl-en">INTELLIDEMAND_MAJOR_VERSION</span>    <span class="pl-c1">5</span></td>
+      </tr>
+      <tr>
+        <td id="L31" class="blob-num js-line-number" data-line-number="31"></td>
+        <td id="LC31" class="blob-code blob-code-inner js-file-line">#<span class="pl-k">define</span> <span class="pl-en">INTELLIDEMAND_MINOR_VERSION</span>    <span class="pl-c1">5</span></td>
+      </tr>
+      <tr>
+        <td id="L32" class="blob-num js-line-number" data-line-number="32"></td>
+        <td id="LC32" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L33" class="blob-num js-line-number" data-line-number="33"></td>
+        <td id="LC33" class="blob-code blob-code-inner js-file-line"><span class="pl-c">/*</span></td>
+      </tr>
+      <tr>
+        <td id="L34" class="blob-num js-line-number" data-line-number="34"></td>
+        <td id="LC34" class="blob-code blob-code-inner js-file-line"><span class="pl-c"> * dbs is used in this file as a shortform for demandbased switching</span></td>
+      </tr>
+      <tr>
+        <td id="L35" class="blob-num js-line-number" data-line-number="35"></td>
+        <td id="LC35" class="blob-code blob-code-inner js-file-line"><span class="pl-c"> * It helps to keep variable names smaller, simpler</span></td>
+      </tr>
+      <tr>
+        <td id="L36" class="blob-num js-line-number" data-line-number="36"></td>
+        <td id="LC36" class="blob-code blob-code-inner js-file-line"><span class="pl-c"> */</span></td>
+      </tr>
+      <tr>
+        <td id="L37" class="blob-num js-line-number" data-line-number="37"></td>
+        <td id="LC37" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L38" class="blob-num js-line-number" data-line-number="38"></td>
+        <td id="LC38" class="blob-code blob-code-inner js-file-line">#<span class="pl-k">define</span> <span class="pl-en">DEF_SAMPLING_RATE</span>			(<span class="pl-c1">20000</span>)</td>
+      </tr>
+      <tr>
+        <td id="L39" class="blob-num js-line-number" data-line-number="39"></td>
+        <td id="LC39" class="blob-code blob-code-inner js-file-line">#<span class="pl-k">define</span> <span class="pl-en">DEF_FREQUENCY_UP_THRESHOLD</span>		(<span class="pl-c1">80</span>)</td>
+      </tr>
+      <tr>
+        <td id="L40" class="blob-num js-line-number" data-line-number="40"></td>
+        <td id="LC40" class="blob-code blob-code-inner js-file-line">#<span class="pl-k">define</span> <span class="pl-en">DEF_SAMPLING_DOWN_FACTOR</span>		(<span class="pl-c1">1</span>)</td>
+      </tr>
+      <tr>
+        <td id="L41" class="blob-num js-line-number" data-line-number="41"></td>
+        <td id="LC41" class="blob-code blob-code-inner js-file-line">#<span class="pl-k">define</span> <span class="pl-en">MAX_SAMPLING_DOWN_FACTOR</span>		(<span class="pl-c1">3</span>)</td>
+      </tr>
+      <tr>
+        <td id="L42" class="blob-num js-line-number" data-line-number="42"></td>
+        <td id="LC42" class="blob-code blob-code-inner js-file-line">#<span class="pl-k">define</span> <span class="pl-en">MICRO_FREQUENCY_UP_THRESHOLD</span>		(<span class="pl-c1">95</span>)</td>
+      </tr>
+      <tr>
+        <td id="L43" class="blob-num js-line-number" data-line-number="43"></td>
+        <td id="LC43" class="blob-code blob-code-inner js-file-line">#<span class="pl-k">define</span> <span class="pl-en">MICRO_FREQUENCY_MIN_SAMPLE_RATE</span>		(<span class="pl-c1">10000</span>)</td>
+      </tr>
+      <tr>
+        <td id="L44" class="blob-num js-line-number" data-line-number="44"></td>
+        <td id="LC44" class="blob-code blob-code-inner js-file-line">#<span class="pl-k">define</span> <span class="pl-en">MIN_FREQUENCY_UP_THRESHOLD</span>		(<span class="pl-c1">11</span>)</td>
+      </tr>
+      <tr>
+        <td id="L45" class="blob-num js-line-number" data-line-number="45"></td>
+        <td id="LC45" class="blob-code blob-code-inner js-file-line">#<span class="pl-k">define</span> <span class="pl-en">MAX_FREQUENCY_UP_THRESHOLD</span>		(<span class="pl-c1">100</span>)</td>
+      </tr>
+      <tr>
+        <td id="L46" class="blob-num js-line-number" data-line-number="46"></td>
+        <td id="LC46" class="blob-code blob-code-inner js-file-line">#<span class="pl-k">define</span> <span class="pl-en">MIN_FREQUENCY_DOWN_DIFFERENTIAL</span>		(<span class="pl-c1">1</span>)</td>
+      </tr>
+      <tr>
+        <td id="L47" class="blob-num js-line-number" data-line-number="47"></td>
+        <td id="LC47" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L48" class="blob-num js-line-number" data-line-number="48"></td>
+        <td id="LC48" class="blob-code blob-code-inner js-file-line">#<span class="pl-k">define</span> <span class="pl-en">DEF_FREQ_STEP</span>				(<span class="pl-c1">25</span>)</td>
+      </tr>
+      <tr>
+        <td id="L49" class="blob-num js-line-number" data-line-number="49"></td>
+        <td id="LC49" class="blob-code blob-code-inner js-file-line">#<span class="pl-k">define</span> <span class="pl-en">DEF_STEP_UP_EARLY_HISPEED</span>		(<span class="pl-c1">1958400</span>)</td>
+      </tr>
+      <tr>
+        <td id="L50" class="blob-num js-line-number" data-line-number="50"></td>
+        <td id="LC50" class="blob-code blob-code-inner js-file-line">#<span class="pl-k">define</span> <span class="pl-en">DEF_STEP_UP_INTERIM_HISPEED</span>		(<span class="pl-c1">2265600</span>)</td>
+      </tr>
+      <tr>
+        <td id="L51" class="blob-num js-line-number" data-line-number="51"></td>
+        <td id="LC51" class="blob-code blob-code-inner js-file-line">#<span class="pl-k">define</span> <span class="pl-en">DEF_SAMPLING_EARLY_HISPEED_FACTOR</span>	(<span class="pl-c1">2</span>)</td>
+      </tr>
+      <tr>
+        <td id="L52" class="blob-num js-line-number" data-line-number="52"></td>
+        <td id="LC52" class="blob-code blob-code-inner js-file-line">#<span class="pl-k">define</span> <span class="pl-en">DEF_SAMPLING_INTERIM_HISPEED_FACTOR</span>	(<span class="pl-c1">3</span>)</td>
+      </tr>
+      <tr>
+        <td id="L53" class="blob-num js-line-number" data-line-number="53"></td>
+        <td id="LC53" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L54" class="blob-num js-line-number" data-line-number="54"></td>
+        <td id="LC54" class="blob-code blob-code-inner js-file-line"><span class="pl-c">/* PATCH : SMART_UP */</span></td>
+      </tr>
+      <tr>
+        <td id="L55" class="blob-num js-line-number" data-line-number="55"></td>
+        <td id="LC55" class="blob-code blob-code-inner js-file-line">#<span class="pl-k">define</span> <span class="pl-en">MIN</span>(<span class="pl-v">X, Y</span>) ((X) &lt; (Y) ? (X) : (Y))</td>
+      </tr>
+      <tr>
+        <td id="L56" class="blob-num js-line-number" data-line-number="56"></td>
+        <td id="LC56" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L57" class="blob-num js-line-number" data-line-number="57"></td>
+        <td id="LC57" class="blob-code blob-code-inner js-file-line">#<span class="pl-k">define</span> <span class="pl-en">SMART_UP_PLUS</span> (<span class="pl-c1">0</span>)</td>
+      </tr>
+      <tr>
+        <td id="L58" class="blob-num js-line-number" data-line-number="58"></td>
+        <td id="LC58" class="blob-code blob-code-inner js-file-line">#<span class="pl-k">define</span> <span class="pl-en">SMART_UP_SLOW_UP_AT_HIGH_FREQ</span> (<span class="pl-c1">1</span>)</td>
+      </tr>
+      <tr>
+        <td id="L59" class="blob-num js-line-number" data-line-number="59"></td>
+        <td id="LC59" class="blob-code blob-code-inner js-file-line">#<span class="pl-k">define</span> <span class="pl-en">SUP_MAX_STEP</span> (<span class="pl-c1">3</span>)</td>
+      </tr>
+      <tr>
+        <td id="L60" class="blob-num js-line-number" data-line-number="60"></td>
+        <td id="LC60" class="blob-code blob-code-inner js-file-line">#<span class="pl-k">define</span> <span class="pl-en">SUP_CORE_NUM</span> (<span class="pl-c1">4</span>)</td>
+      </tr>
+      <tr>
+        <td id="L61" class="blob-num js-line-number" data-line-number="61"></td>
+        <td id="LC61" class="blob-code blob-code-inner js-file-line">#<span class="pl-k">define</span> <span class="pl-en">SUP_SLOW_UP_DUR</span> (<span class="pl-c1">5</span>)</td>
+      </tr>
+      <tr>
+        <td id="L62" class="blob-num js-line-number" data-line-number="62"></td>
+        <td id="LC62" class="blob-code blob-code-inner js-file-line">#<span class="pl-k">define</span> <span class="pl-en">SUP_SLOW_UP_DUR_DEFAULT</span> (<span class="pl-c1">2</span>)</td>
+      </tr>
+      <tr>
+        <td id="L63" class="blob-num js-line-number" data-line-number="63"></td>
+        <td id="LC63" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L64" class="blob-num js-line-number" data-line-number="64"></td>
+        <td id="LC64" class="blob-code blob-code-inner js-file-line">#<span class="pl-k">define</span> <span class="pl-en">SUP_HIGH_SLOW_UP_DUR</span> (<span class="pl-c1">5</span>)</td>
+      </tr>
+      <tr>
+        <td id="L65" class="blob-num js-line-number" data-line-number="65"></td>
+        <td id="LC65" class="blob-code blob-code-inner js-file-line">#<span class="pl-k">define</span> <span class="pl-en">SUP_FREQ_LEVEL</span> (<span class="pl-c1">14</span>)</td>
+      </tr>
+      <tr>
+        <td id="L66" class="blob-num js-line-number" data-line-number="66"></td>
+        <td id="LC66" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L67" class="blob-num js-line-number" data-line-number="67"></td>
+        <td id="LC67" class="blob-code blob-code-inner js-file-line">#<span class="pl-k">if</span> defined(SMART_UP_PLUS)</td>
+      </tr>
+      <tr>
+        <td id="L68" class="blob-num js-line-number" data-line-number="68"></td>
+        <td id="LC68" class="blob-code blob-code-inner js-file-line"><span class="pl-k">static</span> <span class="pl-k">unsigned</span> <span class="pl-k">int</span> SUP_THRESHOLD_STEPS[SUP_MAX_STEP] = {<span class="pl-c1">85</span>, <span class="pl-c1">90</span>, <span class="pl-c1">95</span>};</td>
+      </tr>
+      <tr>
+        <td id="L69" class="blob-num js-line-number" data-line-number="69"></td>
+        <td id="LC69" class="blob-code blob-code-inner js-file-line"><span class="pl-k">static</span> <span class="pl-k">unsigned</span> <span class="pl-k">int</span> SUP_FREQ_STEPS[SUP_MAX_STEP] = {<span class="pl-c1">4</span>, <span class="pl-c1">3</span>, <span class="pl-c1">2</span>};</td>
+      </tr>
+      <tr>
+        <td id="L70" class="blob-num js-line-number" data-line-number="70"></td>
+        <td id="LC70" class="blob-code blob-code-inner js-file-line"><span class="pl-k">typedef</span> <span class="pl-k">struct</span>{</td>
+      </tr>
+      <tr>
+        <td id="L71" class="blob-num js-line-number" data-line-number="71"></td>
+        <td id="LC71" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">unsigned</span> <span class="pl-k">int</span> freq_idx;</td>
+      </tr>
+      <tr>
+        <td id="L72" class="blob-num js-line-number" data-line-number="72"></td>
+        <td id="LC72" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">unsigned</span> <span class="pl-k">int</span> freq_value;</td>
+      </tr>
+      <tr>
+        <td id="L73" class="blob-num js-line-number" data-line-number="73"></td>
+        <td id="LC73" class="blob-code blob-code-inner js-file-line">} freq_table_idx;</td>
+      </tr>
+      <tr>
+        <td id="L74" class="blob-num js-line-number" data-line-number="74"></td>
+        <td id="LC74" class="blob-code blob-code-inner js-file-line"><span class="pl-k">static</span> freq_table_idx pre_freq_idx[SUP_CORE_NUM] = {};</td>
+      </tr>
+      <tr>
+        <td id="L75" class="blob-num js-line-number" data-line-number="75"></td>
+        <td id="LC75" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L76" class="blob-num js-line-number" data-line-number="76"></td>
+        <td id="LC76" class="blob-code blob-code-inner js-file-line">#<span class="pl-k">endif</span></td>
+      </tr>
+      <tr>
+        <td id="L77" class="blob-num js-line-number" data-line-number="77"></td>
+        <td id="LC77" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L78" class="blob-num js-line-number" data-line-number="78"></td>
+        <td id="LC78" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L79" class="blob-num js-line-number" data-line-number="79"></td>
+        <td id="LC79" class="blob-code blob-code-inner js-file-line">#<span class="pl-k">if</span> defined(SMART_UP_SLOW_UP_AT_HIGH_FREQ)</td>
+      </tr>
+      <tr>
+        <td id="L80" class="blob-num js-line-number" data-line-number="80"></td>
+        <td id="LC80" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L81" class="blob-num js-line-number" data-line-number="81"></td>
+        <td id="LC81" class="blob-code blob-code-inner js-file-line">#<span class="pl-k">define</span> <span class="pl-en">SUP_SLOW_UP_FREQUENCY</span>			(<span class="pl-c1">1728000</span>)</td>
+      </tr>
+      <tr>
+        <td id="L82" class="blob-num js-line-number" data-line-number="82"></td>
+        <td id="LC82" class="blob-code blob-code-inner js-file-line">#<span class="pl-k">define</span> <span class="pl-en">SUP_HIGH_SLOW_UP_FREQUENCY</span>		(<span class="pl-c1">2265600</span>)</td>
+      </tr>
+      <tr>
+        <td id="L83" class="blob-num js-line-number" data-line-number="83"></td>
+        <td id="LC83" class="blob-code blob-code-inner js-file-line">#<span class="pl-k">define</span> <span class="pl-en">SUP_SLOW_UP_LOAD</span>			(<span class="pl-c1">75</span>)</td>
+      </tr>
+      <tr>
+        <td id="L84" class="blob-num js-line-number" data-line-number="84"></td>
+        <td id="LC84" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L85" class="blob-num js-line-number" data-line-number="85"></td>
+        <td id="LC85" class="blob-code blob-code-inner js-file-line"><span class="pl-k">typedef</span> <span class="pl-k">struct</span> {</td>
+      </tr>
+      <tr>
+        <td id="L86" class="blob-num js-line-number" data-line-number="86"></td>
+        <td id="LC86" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">unsigned</span> <span class="pl-k">int</span> hist_max_load[SUP_SLOW_UP_DUR];</td>
+      </tr>
+      <tr>
+        <td id="L87" class="blob-num js-line-number" data-line-number="87"></td>
+        <td id="LC87" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">unsigned</span> <span class="pl-k">int</span> hist_load_cnt;</td>
+      </tr>
+      <tr>
+        <td id="L88" class="blob-num js-line-number" data-line-number="88"></td>
+        <td id="LC88" class="blob-code blob-code-inner js-file-line">} history_load;</td>
+      </tr>
+      <tr>
+        <td id="L89" class="blob-num js-line-number" data-line-number="89"></td>
+        <td id="LC89" class="blob-code blob-code-inner js-file-line"><span class="pl-k">static</span> <span class="pl-k">void</span> <span class="pl-en">reset_hist</span>(history_load *hist_load);</td>
+      </tr>
+      <tr>
+        <td id="L90" class="blob-num js-line-number" data-line-number="90"></td>
+        <td id="LC90" class="blob-code blob-code-inner js-file-line"><span class="pl-k">static</span> history_load hist_load[SUP_CORE_NUM] = {};</td>
+      </tr>
+      <tr>
+        <td id="L91" class="blob-num js-line-number" data-line-number="91"></td>
+        <td id="LC91" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L92" class="blob-num js-line-number" data-line-number="92"></td>
+        <td id="LC92" class="blob-code blob-code-inner js-file-line"><span class="pl-k">typedef</span> <span class="pl-k">struct</span> {</td>
+      </tr>
+      <tr>
+        <td id="L93" class="blob-num js-line-number" data-line-number="93"></td>
+        <td id="LC93" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">unsigned</span> <span class="pl-k">int</span> hist_max_load[SUP_HIGH_SLOW_UP_DUR];</td>
+      </tr>
+      <tr>
+        <td id="L94" class="blob-num js-line-number" data-line-number="94"></td>
+        <td id="LC94" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">unsigned</span> <span class="pl-k">int</span> hist_load_cnt;</td>
+      </tr>
+      <tr>
+        <td id="L95" class="blob-num js-line-number" data-line-number="95"></td>
+        <td id="LC95" class="blob-code blob-code-inner js-file-line">} history_load_high;</td>
+      </tr>
+      <tr>
+        <td id="L96" class="blob-num js-line-number" data-line-number="96"></td>
+        <td id="LC96" class="blob-code blob-code-inner js-file-line"><span class="pl-k">static</span> <span class="pl-k">void</span> <span class="pl-en">reset_hist_high</span>(history_load_high *hist_load);</td>
+      </tr>
+      <tr>
+        <td id="L97" class="blob-num js-line-number" data-line-number="97"></td>
+        <td id="LC97" class="blob-code blob-code-inner js-file-line"><span class="pl-k">static</span> history_load_high hist_load_high[SUP_CORE_NUM] = {};</td>
+      </tr>
+      <tr>
+        <td id="L98" class="blob-num js-line-number" data-line-number="98"></td>
+        <td id="LC98" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L99" class="blob-num js-line-number" data-line-number="99"></td>
+        <td id="LC99" class="blob-code blob-code-inner js-file-line">#<span class="pl-k">endif</span></td>
+      </tr>
+      <tr>
+        <td id="L100" class="blob-num js-line-number" data-line-number="100"></td>
+        <td id="LC100" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L101" class="blob-num js-line-number" data-line-number="101"></td>
+        <td id="LC101" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L102" class="blob-num js-line-number" data-line-number="102"></td>
+        <td id="LC102" class="blob-code blob-code-inner js-file-line"><span class="pl-c">/*</span></td>
+      </tr>
+      <tr>
+        <td id="L103" class="blob-num js-line-number" data-line-number="103"></td>
+        <td id="LC103" class="blob-code blob-code-inner js-file-line"><span class="pl-c"> * The polling frequency of this governor depends on the capability of</span></td>
+      </tr>
+      <tr>
+        <td id="L104" class="blob-num js-line-number" data-line-number="104"></td>
+        <td id="LC104" class="blob-code blob-code-inner js-file-line"><span class="pl-c"> * the processor. Default polling frequency is 1000 times the transition</span></td>
+      </tr>
+      <tr>
+        <td id="L105" class="blob-num js-line-number" data-line-number="105"></td>
+        <td id="LC105" class="blob-code blob-code-inner js-file-line"><span class="pl-c"> * latency of the processor. The governor will work on any processor with</span></td>
+      </tr>
+      <tr>
+        <td id="L106" class="blob-num js-line-number" data-line-number="106"></td>
+        <td id="LC106" class="blob-code blob-code-inner js-file-line"><span class="pl-c"> * transition latency &lt;= 10mS, using appropriate sampling</span></td>
+      </tr>
+      <tr>
+        <td id="L107" class="blob-num js-line-number" data-line-number="107"></td>
+        <td id="LC107" class="blob-code blob-code-inner js-file-line"><span class="pl-c"> * rate.</span></td>
+      </tr>
+      <tr>
+        <td id="L108" class="blob-num js-line-number" data-line-number="108"></td>
+        <td id="LC108" class="blob-code blob-code-inner js-file-line"><span class="pl-c"> * For CPUs with transition latency &gt; 10mS (mostly drivers with CPUFREQ_ETERNAL)</span></td>
+      </tr>
+      <tr>
+        <td id="L109" class="blob-num js-line-number" data-line-number="109"></td>
+        <td id="LC109" class="blob-code blob-code-inner js-file-line"><span class="pl-c"> * this governor will not work.</span></td>
+      </tr>
+      <tr>
+        <td id="L110" class="blob-num js-line-number" data-line-number="110"></td>
+        <td id="LC110" class="blob-code blob-code-inner js-file-line"><span class="pl-c"> * All times here are in uS.</span></td>
+      </tr>
+      <tr>
+        <td id="L111" class="blob-num js-line-number" data-line-number="111"></td>
+        <td id="LC111" class="blob-code blob-code-inner js-file-line"><span class="pl-c"> */</span></td>
+      </tr>
+      <tr>
+        <td id="L112" class="blob-num js-line-number" data-line-number="112"></td>
+        <td id="LC112" class="blob-code blob-code-inner js-file-line">#<span class="pl-k">define</span> <span class="pl-en">MIN_SAMPLING_RATE_RATIO</span>			(<span class="pl-c1">2</span>)</td>
+      </tr>
+      <tr>
+        <td id="L113" class="blob-num js-line-number" data-line-number="113"></td>
+        <td id="LC113" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L114" class="blob-num js-line-number" data-line-number="114"></td>
+        <td id="LC114" class="blob-code blob-code-inner js-file-line"><span class="pl-k">static</span> <span class="pl-k">unsigned</span> <span class="pl-k">int</span> min_sampling_rate;</td>
+      </tr>
+      <tr>
+        <td id="L115" class="blob-num js-line-number" data-line-number="115"></td>
+        <td id="LC115" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L116" class="blob-num js-line-number" data-line-number="116"></td>
+        <td id="LC116" class="blob-code blob-code-inner js-file-line">#<span class="pl-k">define</span> <span class="pl-en">LATENCY_MULTIPLIER</span>			(<span class="pl-c1">1000</span>)</td>
+      </tr>
+      <tr>
+        <td id="L117" class="blob-num js-line-number" data-line-number="117"></td>
+        <td id="LC117" class="blob-code blob-code-inner js-file-line">#<span class="pl-k">define</span> <span class="pl-en">MIN_LATENCY_MULTIPLIER</span>			(<span class="pl-c1">100</span>)</td>
+      </tr>
+      <tr>
+        <td id="L118" class="blob-num js-line-number" data-line-number="118"></td>
+        <td id="LC118" class="blob-code blob-code-inner js-file-line">#<span class="pl-k">define</span> <span class="pl-en">TRANSITION_LATENCY_LIMIT</span>		(<span class="pl-c1">10</span> * <span class="pl-c1">1000</span> * <span class="pl-c1">1000</span>)</td>
+      </tr>
+      <tr>
+        <td id="L119" class="blob-num js-line-number" data-line-number="119"></td>
+        <td id="LC119" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L120" class="blob-num js-line-number" data-line-number="120"></td>
+        <td id="LC120" class="blob-code blob-code-inner js-file-line">#<span class="pl-k">define</span> <span class="pl-en">POWERSAVE_BIAS_MAXLEVEL</span>			(<span class="pl-c1">1000</span>)</td>
+      </tr>
+      <tr>
+        <td id="L121" class="blob-num js-line-number" data-line-number="121"></td>
+        <td id="LC121" class="blob-code blob-code-inner js-file-line">#<span class="pl-k">define</span> <span class="pl-en">POWERSAVE_BIAS_MINLEVEL</span>			(-<span class="pl-c1">1000</span>)</td>
+      </tr>
+      <tr>
+        <td id="L122" class="blob-num js-line-number" data-line-number="122"></td>
+        <td id="LC122" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L123" class="blob-num js-line-number" data-line-number="123"></td>
+        <td id="LC123" class="blob-code blob-code-inner js-file-line"><span class="pl-k">static</span> <span class="pl-k">void</span> <span class="pl-en">do_dbs_timer</span>(<span class="pl-k">struct</span> work_struct *work);</td>
+      </tr>
+      <tr>
+        <td id="L124" class="blob-num js-line-number" data-line-number="124"></td>
+        <td id="LC124" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L125" class="blob-num js-line-number" data-line-number="125"></td>
+        <td id="LC125" class="blob-code blob-code-inner js-file-line"><span class="pl-c">/* Sampling types */</span></td>
+      </tr>
+      <tr>
+        <td id="L126" class="blob-num js-line-number" data-line-number="126"></td>
+        <td id="LC126" class="blob-code blob-code-inner js-file-line"><span class="pl-k">enum</span> {DBS_NORMAL_SAMPLE, DBS_SUB_SAMPLE};</td>
+      </tr>
+      <tr>
+        <td id="L127" class="blob-num js-line-number" data-line-number="127"></td>
+        <td id="LC127" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L128" class="blob-num js-line-number" data-line-number="128"></td>
+        <td id="LC128" class="blob-code blob-code-inner js-file-line"><span class="pl-k">struct</span> cpu_dbs_info_s {</td>
+      </tr>
+      <tr>
+        <td id="L129" class="blob-num js-line-number" data-line-number="129"></td>
+        <td id="LC129" class="blob-code blob-code-inner js-file-line">	u64 prev_cpu_idle;</td>
+      </tr>
+      <tr>
+        <td id="L130" class="blob-num js-line-number" data-line-number="130"></td>
+        <td id="LC130" class="blob-code blob-code-inner js-file-line">	u64 prev_cpu_iowait;</td>
+      </tr>
+      <tr>
+        <td id="L131" class="blob-num js-line-number" data-line-number="131"></td>
+        <td id="LC131" class="blob-code blob-code-inner js-file-line">	u64 prev_cpu_wall;</td>
+      </tr>
+      <tr>
+        <td id="L132" class="blob-num js-line-number" data-line-number="132"></td>
+        <td id="LC132" class="blob-code blob-code-inner js-file-line">	u64 prev_cpu_nice;</td>
+      </tr>
+      <tr>
+        <td id="L133" class="blob-num js-line-number" data-line-number="133"></td>
+        <td id="LC133" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">struct</span> cpufreq_policy *cur_policy;</td>
+      </tr>
+      <tr>
+        <td id="L134" class="blob-num js-line-number" data-line-number="134"></td>
+        <td id="LC134" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">struct</span> delayed_work work;</td>
+      </tr>
+      <tr>
+        <td id="L135" class="blob-num js-line-number" data-line-number="135"></td>
+        <td id="LC135" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">struct</span> cpufreq_frequency_table *freq_table;</td>
+      </tr>
+      <tr>
+        <td id="L136" class="blob-num js-line-number" data-line-number="136"></td>
+        <td id="LC136" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">unsigned</span> <span class="pl-k">int</span> freq_lo;</td>
+      </tr>
+      <tr>
+        <td id="L137" class="blob-num js-line-number" data-line-number="137"></td>
+        <td id="LC137" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">unsigned</span> <span class="pl-k">int</span> freq_lo_jiffies;</td>
+      </tr>
+      <tr>
+        <td id="L138" class="blob-num js-line-number" data-line-number="138"></td>
+        <td id="LC138" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">unsigned</span> <span class="pl-k">int</span> freq_hi_jiffies;</td>
+      </tr>
+      <tr>
+        <td id="L139" class="blob-num js-line-number" data-line-number="139"></td>
+        <td id="LC139" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">unsigned</span> <span class="pl-k">int</span> rate_mult;</td>
+      </tr>
+      <tr>
+        <td id="L140" class="blob-num js-line-number" data-line-number="140"></td>
+        <td id="LC140" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">unsigned</span> <span class="pl-k">int</span> prev_load;</td>
+      </tr>
+      <tr>
+        <td id="L141" class="blob-num js-line-number" data-line-number="141"></td>
+        <td id="LC141" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">unsigned</span> <span class="pl-k">int</span> max_load;</td>
+      </tr>
+      <tr>
+        <td id="L142" class="blob-num js-line-number" data-line-number="142"></td>
+        <td id="LC142" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">unsigned</span> <span class="pl-k">int</span> cpu;</td>
+      </tr>
+      <tr>
+        <td id="L143" class="blob-num js-line-number" data-line-number="143"></td>
+        <td id="LC143" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">unsigned</span> <span class="pl-k">int</span> sample_type:<span class="pl-c1">1</span>;</td>
+      </tr>
+      <tr>
+        <td id="L144" class="blob-num js-line-number" data-line-number="144"></td>
+        <td id="LC144" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">unsigned</span> <span class="pl-k">int</span> freq_stay_count;</td>
+      </tr>
+      <tr>
+        <td id="L145" class="blob-num js-line-number" data-line-number="145"></td>
+        <td id="LC145" class="blob-code blob-code-inner js-file-line">	<span class="pl-c">/*</span></td>
+      </tr>
+      <tr>
+        <td id="L146" class="blob-num js-line-number" data-line-number="146"></td>
+        <td id="LC146" class="blob-code blob-code-inner js-file-line"><span class="pl-c">	 * percpu mutex that serializes governor limit change with</span></td>
+      </tr>
+      <tr>
+        <td id="L147" class="blob-num js-line-number" data-line-number="147"></td>
+        <td id="LC147" class="blob-code blob-code-inner js-file-line"><span class="pl-c">	 * do_dbs_timer invocation. We do not want do_dbs_timer to run</span></td>
+      </tr>
+      <tr>
+        <td id="L148" class="blob-num js-line-number" data-line-number="148"></td>
+        <td id="LC148" class="blob-code blob-code-inner js-file-line"><span class="pl-c">	 * when user is changing the governor or limits.</span></td>
+      </tr>
+      <tr>
+        <td id="L149" class="blob-num js-line-number" data-line-number="149"></td>
+        <td id="LC149" class="blob-code blob-code-inner js-file-line"><span class="pl-c">	 */</span></td>
+      </tr>
+      <tr>
+        <td id="L150" class="blob-num js-line-number" data-line-number="150"></td>
+        <td id="LC150" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">struct</span> mutex timer_mutex;</td>
+      </tr>
+      <tr>
+        <td id="L151" class="blob-num js-line-number" data-line-number="151"></td>
+        <td id="LC151" class="blob-code blob-code-inner js-file-line">};</td>
+      </tr>
+      <tr>
+        <td id="L152" class="blob-num js-line-number" data-line-number="152"></td>
+        <td id="LC152" class="blob-code blob-code-inner js-file-line"><span class="pl-k">static</span> <span class="pl-en">DEFINE_PER_CPU</span>(<span class="pl-k">struct</span> cpu_dbs_info_s, id_cpu_dbs_info);</td>
+      </tr>
+      <tr>
+        <td id="L153" class="blob-num js-line-number" data-line-number="153"></td>
+        <td id="LC153" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L154" class="blob-num js-line-number" data-line-number="154"></td>
+        <td id="LC154" class="blob-code blob-code-inner js-file-line"><span class="pl-k">static</span> <span class="pl-k">inline</span> <span class="pl-k">void</span> <span class="pl-en">dbs_timer_init</span>(<span class="pl-k">struct</span> cpu_dbs_info_s *dbs_info);</td>
+      </tr>
+      <tr>
+        <td id="L155" class="blob-num js-line-number" data-line-number="155"></td>
+        <td id="LC155" class="blob-code blob-code-inner js-file-line"><span class="pl-k">static</span> <span class="pl-k">inline</span> <span class="pl-k">void</span> <span class="pl-en">dbs_timer_exit</span>(<span class="pl-k">struct</span> cpu_dbs_info_s *dbs_info);</td>
+      </tr>
+      <tr>
+        <td id="L156" class="blob-num js-line-number" data-line-number="156"></td>
+        <td id="LC156" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L157" class="blob-num js-line-number" data-line-number="157"></td>
+        <td id="LC157" class="blob-code blob-code-inner js-file-line"><span class="pl-k">static</span> <span class="pl-k">unsigned</span> <span class="pl-k">int</span> dbs_enable;	<span class="pl-c">/* number of CPUs using this policy */</span></td>
+      </tr>
+      <tr>
+        <td id="L158" class="blob-num js-line-number" data-line-number="158"></td>
+        <td id="LC158" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L159" class="blob-num js-line-number" data-line-number="159"></td>
+        <td id="LC159" class="blob-code blob-code-inner js-file-line"><span class="pl-c">/*</span></td>
+      </tr>
+      <tr>
+        <td id="L160" class="blob-num js-line-number" data-line-number="160"></td>
+        <td id="LC160" class="blob-code blob-code-inner js-file-line"><span class="pl-c"> * dbs_mutex protects dbs_enable and dbs_info during start/stop.</span></td>
+      </tr>
+      <tr>
+        <td id="L161" class="blob-num js-line-number" data-line-number="161"></td>
+        <td id="LC161" class="blob-code blob-code-inner js-file-line"><span class="pl-c"> */</span></td>
+      </tr>
+      <tr>
+        <td id="L162" class="blob-num js-line-number" data-line-number="162"></td>
+        <td id="LC162" class="blob-code blob-code-inner js-file-line"><span class="pl-k">static</span> <span class="pl-en">DEFINE_MUTEX</span>(dbs_mutex);</td>
+      </tr>
+      <tr>
+        <td id="L163" class="blob-num js-line-number" data-line-number="163"></td>
+        <td id="LC163" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L164" class="blob-num js-line-number" data-line-number="164"></td>
+        <td id="LC164" class="blob-code blob-code-inner js-file-line"><span class="pl-k">static</span> <span class="pl-k">struct</span> workqueue_struct *dbs_wq;</td>
+      </tr>
+      <tr>
+        <td id="L165" class="blob-num js-line-number" data-line-number="165"></td>
+        <td id="LC165" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L166" class="blob-num js-line-number" data-line-number="166"></td>
+        <td id="LC166" class="blob-code blob-code-inner js-file-line"><span class="pl-k">static</span> <span class="pl-k">struct</span> dbs_tuners {</td>
+      </tr>
+      <tr>
+        <td id="L167" class="blob-num js-line-number" data-line-number="167"></td>
+        <td id="LC167" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">unsigned</span> <span class="pl-k">int</span> sampling_rate;</td>
+      </tr>
+      <tr>
+        <td id="L168" class="blob-num js-line-number" data-line-number="168"></td>
+        <td id="LC168" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">unsigned</span> <span class="pl-k">int</span> up_threshold;</td>
+      </tr>
+      <tr>
+        <td id="L169" class="blob-num js-line-number" data-line-number="169"></td>
+        <td id="LC169" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">unsigned</span> <span class="pl-k">int</span> up_threshold_multi_core;</td>
+      </tr>
+      <tr>
+        <td id="L170" class="blob-num js-line-number" data-line-number="170"></td>
+        <td id="LC170" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">unsigned</span> <span class="pl-k">int</span> optimal_freq;</td>
+      </tr>
+      <tr>
+        <td id="L171" class="blob-num js-line-number" data-line-number="171"></td>
+        <td id="LC171" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">unsigned</span> <span class="pl-k">int</span> up_threshold_any_cpu_load;</td>
+      </tr>
+      <tr>
+        <td id="L172" class="blob-num js-line-number" data-line-number="172"></td>
+        <td id="LC172" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">unsigned</span> <span class="pl-k">int</span> sync_freq;</td>
+      </tr>
+      <tr>
+        <td id="L173" class="blob-num js-line-number" data-line-number="173"></td>
+        <td id="LC173" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">unsigned</span> <span class="pl-k">int</span> sampling_down_factor;</td>
+      </tr>
+      <tr>
+        <td id="L174" class="blob-num js-line-number" data-line-number="174"></td>
+        <td id="LC174" class="blob-code blob-code-inner js-file-line">	<span class="pl-c">/* 20130711 smart_up */</span></td>
+      </tr>
+      <tr>
+        <td id="L175" class="blob-num js-line-number" data-line-number="175"></td>
+        <td id="LC175" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">unsigned</span> <span class="pl-k">int</span> smart_up;</td>
+      </tr>
+      <tr>
+        <td id="L176" class="blob-num js-line-number" data-line-number="176"></td>
+        <td id="LC176" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">unsigned</span> <span class="pl-k">int</span> smart_slow_up_load;</td>
+      </tr>
+      <tr>
+        <td id="L177" class="blob-num js-line-number" data-line-number="177"></td>
+        <td id="LC177" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">unsigned</span> <span class="pl-k">int</span> smart_slow_up_freq;</td>
+      </tr>
+      <tr>
+        <td id="L178" class="blob-num js-line-number" data-line-number="178"></td>
+        <td id="LC178" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">unsigned</span> <span class="pl-k">int</span> smart_slow_up_dur;</td>
+      </tr>
+      <tr>
+        <td id="L179" class="blob-num js-line-number" data-line-number="179"></td>
+        <td id="LC179" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">unsigned</span> <span class="pl-k">int</span> smart_high_slow_up_freq;</td>
+      </tr>
+      <tr>
+        <td id="L180" class="blob-num js-line-number" data-line-number="180"></td>
+        <td id="LC180" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">unsigned</span> <span class="pl-k">int</span> smart_high_slow_up_dur;</td>
+      </tr>
+      <tr>
+        <td id="L181" class="blob-num js-line-number" data-line-number="181"></td>
+        <td id="LC181" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">unsigned</span> <span class="pl-k">int</span> smart_each_off;</td>
+      </tr>
+      <tr>
+        <td id="L182" class="blob-num js-line-number" data-line-number="182"></td>
+        <td id="LC182" class="blob-code blob-code-inner js-file-line">	<span class="pl-c">/* end smart_up */</span></td>
+      </tr>
+      <tr>
+        <td id="L183" class="blob-num js-line-number" data-line-number="183"></td>
+        <td id="LC183" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">unsigned</span> <span class="pl-k">int</span> freq_step;</td>
+      </tr>
+      <tr>
+        <td id="L184" class="blob-num js-line-number" data-line-number="184"></td>
+        <td id="LC184" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">unsigned</span> <span class="pl-k">int</span> step_up_early_hispeed;</td>
+      </tr>
+      <tr>
+        <td id="L185" class="blob-num js-line-number" data-line-number="185"></td>
+        <td id="LC185" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">unsigned</span> <span class="pl-k">int</span> step_up_interim_hispeed;</td>
+      </tr>
+      <tr>
+        <td id="L186" class="blob-num js-line-number" data-line-number="186"></td>
+        <td id="LC186" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">unsigned</span> <span class="pl-k">int</span> sampling_early_factor;</td>
+      </tr>
+      <tr>
+        <td id="L187" class="blob-num js-line-number" data-line-number="187"></td>
+        <td id="LC187" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">unsigned</span> <span class="pl-k">int</span> sampling_interim_factor;</td>
+      </tr>
+      <tr>
+        <td id="L188" class="blob-num js-line-number" data-line-number="188"></td>
+        <td id="LC188" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">unsigned</span> <span class="pl-k">int</span> two_phase_freq;</td>
+      </tr>
+      <tr>
+        <td id="L189" class="blob-num js-line-number" data-line-number="189"></td>
+        <td id="LC189" class="blob-code blob-code-inner js-file-line">} dbs_tuners_ins = {</td>
+      </tr>
+      <tr>
+        <td id="L190" class="blob-num js-line-number" data-line-number="190"></td>
+        <td id="LC190" class="blob-code blob-code-inner js-file-line">	.<span class="pl-smi">up_threshold_multi_core</span> = DEF_FREQUENCY_UP_THRESHOLD,</td>
+      </tr>
+      <tr>
+        <td id="L191" class="blob-num js-line-number" data-line-number="191"></td>
+        <td id="LC191" class="blob-code blob-code-inner js-file-line">	.<span class="pl-smi">up_threshold</span> = DEF_FREQUENCY_UP_THRESHOLD,</td>
+      </tr>
+      <tr>
+        <td id="L192" class="blob-num js-line-number" data-line-number="192"></td>
+        <td id="LC192" class="blob-code blob-code-inner js-file-line">	.<span class="pl-smi">sampling_down_factor</span> = DEF_SAMPLING_DOWN_FACTOR,</td>
+      </tr>
+      <tr>
+        <td id="L193" class="blob-num js-line-number" data-line-number="193"></td>
+        <td id="LC193" class="blob-code blob-code-inner js-file-line">	.<span class="pl-smi">up_threshold_any_cpu_load</span> = DEF_FREQUENCY_UP_THRESHOLD,</td>
+      </tr>
+      <tr>
+        <td id="L194" class="blob-num js-line-number" data-line-number="194"></td>
+        <td id="LC194" class="blob-code blob-code-inner js-file-line">	.<span class="pl-smi">sync_freq</span> = <span class="pl-c1">1574400</span>,</td>
+      </tr>
+      <tr>
+        <td id="L195" class="blob-num js-line-number" data-line-number="195"></td>
+        <td id="LC195" class="blob-code blob-code-inner js-file-line">	.<span class="pl-smi">optimal_freq</span> = <span class="pl-c1">1574400</span>,</td>
+      </tr>
+      <tr>
+        <td id="L196" class="blob-num js-line-number" data-line-number="196"></td>
+        <td id="LC196" class="blob-code blob-code-inner js-file-line">	<span class="pl-c">/* 20130711 smart_up */</span></td>
+      </tr>
+      <tr>
+        <td id="L197" class="blob-num js-line-number" data-line-number="197"></td>
+        <td id="LC197" class="blob-code blob-code-inner js-file-line">	.<span class="pl-smi">smart_up</span> = SMART_UP_PLUS,</td>
+      </tr>
+      <tr>
+        <td id="L198" class="blob-num js-line-number" data-line-number="198"></td>
+        <td id="LC198" class="blob-code blob-code-inner js-file-line">	.<span class="pl-smi">smart_slow_up_load</span> = SUP_SLOW_UP_LOAD,</td>
+      </tr>
+      <tr>
+        <td id="L199" class="blob-num js-line-number" data-line-number="199"></td>
+        <td id="LC199" class="blob-code blob-code-inner js-file-line">	.<span class="pl-smi">smart_slow_up_freq</span> = SUP_SLOW_UP_FREQUENCY,</td>
+      </tr>
+      <tr>
+        <td id="L200" class="blob-num js-line-number" data-line-number="200"></td>
+        <td id="LC200" class="blob-code blob-code-inner js-file-line">	.<span class="pl-smi">smart_slow_up_dur</span> = SUP_SLOW_UP_DUR_DEFAULT,</td>
+      </tr>
+      <tr>
+        <td id="L201" class="blob-num js-line-number" data-line-number="201"></td>
+        <td id="LC201" class="blob-code blob-code-inner js-file-line">	.<span class="pl-smi">smart_high_slow_up_freq</span> = SUP_HIGH_SLOW_UP_FREQUENCY,</td>
+      </tr>
+      <tr>
+        <td id="L202" class="blob-num js-line-number" data-line-number="202"></td>
+        <td id="LC202" class="blob-code blob-code-inner js-file-line">	.<span class="pl-smi">smart_high_slow_up_dur</span> = SUP_HIGH_SLOW_UP_DUR,</td>
+      </tr>
+      <tr>
+        <td id="L203" class="blob-num js-line-number" data-line-number="203"></td>
+        <td id="LC203" class="blob-code blob-code-inner js-file-line">	.<span class="pl-smi">smart_each_off</span> = <span class="pl-c1">0</span>,</td>
+      </tr>
+      <tr>
+        <td id="L204" class="blob-num js-line-number" data-line-number="204"></td>
+        <td id="LC204" class="blob-code blob-code-inner js-file-line">	<span class="pl-c">/* end smart_up */</span></td>
+      </tr>
+      <tr>
+        <td id="L205" class="blob-num js-line-number" data-line-number="205"></td>
+        <td id="LC205" class="blob-code blob-code-inner js-file-line">	.<span class="pl-smi">freq_step</span> = DEF_FREQ_STEP,</td>
+      </tr>
+      <tr>
+        <td id="L206" class="blob-num js-line-number" data-line-number="206"></td>
+        <td id="LC206" class="blob-code blob-code-inner js-file-line">	.<span class="pl-smi">step_up_early_hispeed</span> = DEF_STEP_UP_EARLY_HISPEED,</td>
+      </tr>
+      <tr>
+        <td id="L207" class="blob-num js-line-number" data-line-number="207"></td>
+        <td id="LC207" class="blob-code blob-code-inner js-file-line">	.<span class="pl-smi">step_up_interim_hispeed</span> = DEF_STEP_UP_INTERIM_HISPEED,</td>
+      </tr>
+      <tr>
+        <td id="L208" class="blob-num js-line-number" data-line-number="208"></td>
+        <td id="LC208" class="blob-code blob-code-inner js-file-line">	.<span class="pl-smi">sampling_early_factor</span> = DEF_SAMPLING_EARLY_HISPEED_FACTOR,</td>
+      </tr>
+      <tr>
+        <td id="L209" class="blob-num js-line-number" data-line-number="209"></td>
+        <td id="LC209" class="blob-code blob-code-inner js-file-line">	.<span class="pl-smi">sampling_interim_factor</span> = DEF_SAMPLING_INTERIM_HISPEED_FACTOR,</td>
+      </tr>
+      <tr>
+        <td id="L210" class="blob-num js-line-number" data-line-number="210"></td>
+        <td id="LC210" class="blob-code blob-code-inner js-file-line">	.<span class="pl-smi">two_phase_freq</span> = <span class="pl-c1">0</span>,</td>
+      </tr>
+      <tr>
+        <td id="L211" class="blob-num js-line-number" data-line-number="211"></td>
+        <td id="LC211" class="blob-code blob-code-inner js-file-line">	.<span class="pl-smi">sampling_rate</span> = DEF_SAMPLING_RATE,</td>
+      </tr>
+      <tr>
+        <td id="L212" class="blob-num js-line-number" data-line-number="212"></td>
+        <td id="LC212" class="blob-code blob-code-inner js-file-line">};</td>
+      </tr>
+      <tr>
+        <td id="L213" class="blob-num js-line-number" data-line-number="213"></td>
+        <td id="LC213" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L214" class="blob-num js-line-number" data-line-number="214"></td>
+        <td id="LC214" class="blob-code blob-code-inner js-file-line"><span class="pl-c">/************************** sysfs interface ************************/</span></td>
+      </tr>
+      <tr>
+        <td id="L215" class="blob-num js-line-number" data-line-number="215"></td>
+        <td id="LC215" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L216" class="blob-num js-line-number" data-line-number="216"></td>
+        <td id="LC216" class="blob-code blob-code-inner js-file-line"><span class="pl-k">static</span> <span class="pl-c1">ssize_t</span> <span class="pl-en">show_sampling_rate_min</span>(<span class="pl-k">struct</span> kobject *kobj,</td>
+      </tr>
+      <tr>
+        <td id="L217" class="blob-num js-line-number" data-line-number="217"></td>
+        <td id="LC217" class="blob-code blob-code-inner js-file-line">				      <span class="pl-k">struct</span> attribute *attr, <span class="pl-k">char</span> *buf)</td>
+      </tr>
+      <tr>
+        <td id="L218" class="blob-num js-line-number" data-line-number="218"></td>
+        <td id="LC218" class="blob-code blob-code-inner js-file-line">{</td>
+      </tr>
+      <tr>
+        <td id="L219" class="blob-num js-line-number" data-line-number="219"></td>
+        <td id="LC219" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">return</span> <span class="pl-c1">sprintf</span>(buf, <span class="pl-s"><span class="pl-pds">&quot;</span><span class="pl-c1">%u</span><span class="pl-cce">\n</span><span class="pl-pds">&quot;</span></span>, min_sampling_rate);</td>
+      </tr>
+      <tr>
+        <td id="L220" class="blob-num js-line-number" data-line-number="220"></td>
+        <td id="LC220" class="blob-code blob-code-inner js-file-line">}</td>
+      </tr>
+      <tr>
+        <td id="L221" class="blob-num js-line-number" data-line-number="221"></td>
+        <td id="LC221" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L222" class="blob-num js-line-number" data-line-number="222"></td>
+        <td id="LC222" class="blob-code blob-code-inner js-file-line"><span class="pl-en">define_one_global_ro</span>(sampling_rate_min);</td>
+      </tr>
+      <tr>
+        <td id="L223" class="blob-num js-line-number" data-line-number="223"></td>
+        <td id="LC223" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L224" class="blob-num js-line-number" data-line-number="224"></td>
+        <td id="LC224" class="blob-code blob-code-inner js-file-line"><span class="pl-c">/* cpufreq_intellidemand Governor Tunables */</span></td>
+      </tr>
+      <tr>
+        <td id="L225" class="blob-num js-line-number" data-line-number="225"></td>
+        <td id="LC225" class="blob-code blob-code-inner js-file-line">#<span class="pl-k">define</span> <span class="pl-en">show_one</span>(<span class="pl-v">file_name, object</span>)					\</td>
+      </tr>
+      <tr>
+        <td id="L226" class="blob-num js-line-number" data-line-number="226"></td>
+        <td id="LC226" class="blob-code blob-code-inner js-file-line"><span class="pl-k">static</span> <span class="pl-c1">ssize_t</span> show_##file_name						\</td>
+      </tr>
+      <tr>
+        <td id="L227" class="blob-num js-line-number" data-line-number="227"></td>
+        <td id="LC227" class="blob-code blob-code-inner js-file-line">(<span class="pl-k">struct</span> kobject *kobj, <span class="pl-k">struct</span> attribute *attr, <span class="pl-k">char</span> *buf)	      \</td>
+      </tr>
+      <tr>
+        <td id="L228" class="blob-num js-line-number" data-line-number="228"></td>
+        <td id="LC228" class="blob-code blob-code-inner js-file-line">{									\</td>
+      </tr>
+      <tr>
+        <td id="L229" class="blob-num js-line-number" data-line-number="229"></td>
+        <td id="LC229" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">return</span> <span class="pl-c1">sprintf</span>(buf, <span class="pl-s"><span class="pl-pds">&quot;</span><span class="pl-c1">%u</span><span class="pl-cce">\n</span><span class="pl-pds">&quot;</span></span>, dbs_tuners_ins.<span class="pl-smi">object</span>);		\</td>
+      </tr>
+      <tr>
+        <td id="L230" class="blob-num js-line-number" data-line-number="230"></td>
+        <td id="LC230" class="blob-code blob-code-inner js-file-line">}</td>
+      </tr>
+      <tr>
+        <td id="L231" class="blob-num js-line-number" data-line-number="231"></td>
+        <td id="LC231" class="blob-code blob-code-inner js-file-line"><span class="pl-en">show_one</span>(sampling_rate, sampling_rate);</td>
+      </tr>
+      <tr>
+        <td id="L232" class="blob-num js-line-number" data-line-number="232"></td>
+        <td id="LC232" class="blob-code blob-code-inner js-file-line"><span class="pl-en">show_one</span>(up_threshold, up_threshold);</td>
+      </tr>
+      <tr>
+        <td id="L233" class="blob-num js-line-number" data-line-number="233"></td>
+        <td id="LC233" class="blob-code blob-code-inner js-file-line"><span class="pl-en">show_one</span>(up_threshold_multi_core, up_threshold_multi_core);</td>
+      </tr>
+      <tr>
+        <td id="L234" class="blob-num js-line-number" data-line-number="234"></td>
+        <td id="LC234" class="blob-code blob-code-inner js-file-line"><span class="pl-en">show_one</span>(sampling_down_factor, sampling_down_factor);</td>
+      </tr>
+      <tr>
+        <td id="L235" class="blob-num js-line-number" data-line-number="235"></td>
+        <td id="LC235" class="blob-code blob-code-inner js-file-line"><span class="pl-en">show_one</span>(optimal_freq, optimal_freq);</td>
+      </tr>
+      <tr>
+        <td id="L236" class="blob-num js-line-number" data-line-number="236"></td>
+        <td id="LC236" class="blob-code blob-code-inner js-file-line"><span class="pl-en">show_one</span>(up_threshold_any_cpu_load, up_threshold_any_cpu_load);</td>
+      </tr>
+      <tr>
+        <td id="L237" class="blob-num js-line-number" data-line-number="237"></td>
+        <td id="LC237" class="blob-code blob-code-inner js-file-line"><span class="pl-en">show_one</span>(sync_freq, sync_freq);</td>
+      </tr>
+      <tr>
+        <td id="L238" class="blob-num js-line-number" data-line-number="238"></td>
+        <td id="LC238" class="blob-code blob-code-inner js-file-line"><span class="pl-c">/* 20130711 smart_up */</span></td>
+      </tr>
+      <tr>
+        <td id="L239" class="blob-num js-line-number" data-line-number="239"></td>
+        <td id="LC239" class="blob-code blob-code-inner js-file-line"><span class="pl-en">show_one</span>(smart_up, smart_up);</td>
+      </tr>
+      <tr>
+        <td id="L240" class="blob-num js-line-number" data-line-number="240"></td>
+        <td id="LC240" class="blob-code blob-code-inner js-file-line"><span class="pl-en">show_one</span>(smart_slow_up_load, smart_slow_up_load);</td>
+      </tr>
+      <tr>
+        <td id="L241" class="blob-num js-line-number" data-line-number="241"></td>
+        <td id="LC241" class="blob-code blob-code-inner js-file-line"><span class="pl-en">show_one</span>(smart_slow_up_freq, smart_slow_up_freq);</td>
+      </tr>
+      <tr>
+        <td id="L242" class="blob-num js-line-number" data-line-number="242"></td>
+        <td id="LC242" class="blob-code blob-code-inner js-file-line"><span class="pl-en">show_one</span>(smart_slow_up_dur, smart_slow_up_dur);</td>
+      </tr>
+      <tr>
+        <td id="L243" class="blob-num js-line-number" data-line-number="243"></td>
+        <td id="LC243" class="blob-code blob-code-inner js-file-line"><span class="pl-en">show_one</span>(smart_high_slow_up_freq, smart_high_slow_up_freq);</td>
+      </tr>
+      <tr>
+        <td id="L244" class="blob-num js-line-number" data-line-number="244"></td>
+        <td id="LC244" class="blob-code blob-code-inner js-file-line"><span class="pl-en">show_one</span>(smart_high_slow_up_dur, smart_high_slow_up_dur);</td>
+      </tr>
+      <tr>
+        <td id="L245" class="blob-num js-line-number" data-line-number="245"></td>
+        <td id="LC245" class="blob-code blob-code-inner js-file-line"><span class="pl-en">show_one</span>(smart_each_off, smart_each_off);</td>
+      </tr>
+      <tr>
+        <td id="L246" class="blob-num js-line-number" data-line-number="246"></td>
+        <td id="LC246" class="blob-code blob-code-inner js-file-line"><span class="pl-c">/* end smart_up */</span></td>
+      </tr>
+      <tr>
+        <td id="L247" class="blob-num js-line-number" data-line-number="247"></td>
+        <td id="LC247" class="blob-code blob-code-inner js-file-line"><span class="pl-en">show_one</span>(freq_step, freq_step);</td>
+      </tr>
+      <tr>
+        <td id="L248" class="blob-num js-line-number" data-line-number="248"></td>
+        <td id="LC248" class="blob-code blob-code-inner js-file-line"><span class="pl-en">show_one</span>(step_up_early_hispeed, step_up_early_hispeed);</td>
+      </tr>
+      <tr>
+        <td id="L249" class="blob-num js-line-number" data-line-number="249"></td>
+        <td id="LC249" class="blob-code blob-code-inner js-file-line"><span class="pl-en">show_one</span>(step_up_interim_hispeed, step_up_interim_hispeed);</td>
+      </tr>
+      <tr>
+        <td id="L250" class="blob-num js-line-number" data-line-number="250"></td>
+        <td id="LC250" class="blob-code blob-code-inner js-file-line"><span class="pl-en">show_one</span>(sampling_early_factor, sampling_early_factor);</td>
+      </tr>
+      <tr>
+        <td id="L251" class="blob-num js-line-number" data-line-number="251"></td>
+        <td id="LC251" class="blob-code blob-code-inner js-file-line"><span class="pl-en">show_one</span>(sampling_interim_factor, sampling_interim_factor);</td>
+      </tr>
+      <tr>
+        <td id="L252" class="blob-num js-line-number" data-line-number="252"></td>
+        <td id="LC252" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L253" class="blob-num js-line-number" data-line-number="253"></td>
+        <td id="LC253" class="blob-code blob-code-inner js-file-line"><span class="pl-k">static</span> <span class="pl-k">int</span> two_phase_freq_array[NR_CPUS] = {[<span class="pl-c1">0</span> ... NR_CPUS-<span class="pl-c1">1</span>] = <span class="pl-c1">1958400</span>} ;</td>
+      </tr>
+      <tr>
+        <td id="L254" class="blob-num js-line-number" data-line-number="254"></td>
+        <td id="LC254" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L255" class="blob-num js-line-number" data-line-number="255"></td>
+        <td id="LC255" class="blob-code blob-code-inner js-file-line"><span class="pl-k">static</span> <span class="pl-c1">ssize_t</span> show_two_phase_freq</td>
+      </tr>
+      <tr>
+        <td id="L256" class="blob-num js-line-number" data-line-number="256"></td>
+        <td id="LC256" class="blob-code blob-code-inner js-file-line">(<span class="pl-k">struct</span> kobject *kobj, <span class="pl-k">struct</span> attribute *attr, <span class="pl-k">char</span> *buf)</td>
+      </tr>
+      <tr>
+        <td id="L257" class="blob-num js-line-number" data-line-number="257"></td>
+        <td id="LC257" class="blob-code blob-code-inner js-file-line">{</td>
+      </tr>
+      <tr>
+        <td id="L258" class="blob-num js-line-number" data-line-number="258"></td>
+        <td id="LC258" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">int</span> i = <span class="pl-c1">0</span> ;</td>
+      </tr>
+      <tr>
+        <td id="L259" class="blob-num js-line-number" data-line-number="259"></td>
+        <td id="LC259" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">int</span> shift = <span class="pl-c1">0</span> ;</td>
+      </tr>
+      <tr>
+        <td id="L260" class="blob-num js-line-number" data-line-number="260"></td>
+        <td id="LC260" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">char</span> *buf_pos = buf;</td>
+      </tr>
+      <tr>
+        <td id="L261" class="blob-num js-line-number" data-line-number="261"></td>
+        <td id="LC261" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">for</span> ( i = <span class="pl-c1">0</span> ; i &lt; NR_CPUS; i++) {</td>
+      </tr>
+      <tr>
+        <td id="L262" class="blob-num js-line-number" data-line-number="262"></td>
+        <td id="LC262" class="blob-code blob-code-inner js-file-line">		shift = <span class="pl-c1">sprintf</span>(buf_pos,<span class="pl-s"><span class="pl-pds">&quot;</span><span class="pl-c1">%d</span>,<span class="pl-pds">&quot;</span></span>,two_phase_freq_array[i]);</td>
+      </tr>
+      <tr>
+        <td id="L263" class="blob-num js-line-number" data-line-number="263"></td>
+        <td id="LC263" class="blob-code blob-code-inner js-file-line">		buf_pos += shift;</td>
+      </tr>
+      <tr>
+        <td id="L264" class="blob-num js-line-number" data-line-number="264"></td>
+        <td id="LC264" class="blob-code blob-code-inner js-file-line">	}</td>
+      </tr>
+      <tr>
+        <td id="L265" class="blob-num js-line-number" data-line-number="265"></td>
+        <td id="LC265" class="blob-code blob-code-inner js-file-line">	*(buf_pos-<span class="pl-c1">1</span>) = <span class="pl-s"><span class="pl-pds">&#39;</span><span class="pl-cce">\0</span><span class="pl-pds">&#39;</span></span>;</td>
+      </tr>
+      <tr>
+        <td id="L266" class="blob-num js-line-number" data-line-number="266"></td>
+        <td id="LC266" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">return</span> <span class="pl-c1">strlen</span>(buf);</td>
+      </tr>
+      <tr>
+        <td id="L267" class="blob-num js-line-number" data-line-number="267"></td>
+        <td id="LC267" class="blob-code blob-code-inner js-file-line">}</td>
+      </tr>
+      <tr>
+        <td id="L268" class="blob-num js-line-number" data-line-number="268"></td>
+        <td id="LC268" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L269" class="blob-num js-line-number" data-line-number="269"></td>
+        <td id="LC269" class="blob-code blob-code-inner js-file-line"><span class="pl-k">static</span> <span class="pl-c1">ssize_t</span> <span class="pl-en">store_two_phase_freq</span>(<span class="pl-k">struct</span> kobject *a, <span class="pl-k">struct</span> attribute *b,</td>
+      </tr>
+      <tr>
+        <td id="L270" class="blob-num js-line-number" data-line-number="270"></td>
+        <td id="LC270" class="blob-code blob-code-inner js-file-line">		<span class="pl-k">const</span> <span class="pl-k">char</span> *buf, <span class="pl-c1">size_t</span> count)</td>
+      </tr>
+      <tr>
+        <td id="L271" class="blob-num js-line-number" data-line-number="271"></td>
+        <td id="LC271" class="blob-code blob-code-inner js-file-line">{</td>
+      </tr>
+      <tr>
+        <td id="L272" class="blob-num js-line-number" data-line-number="272"></td>
+        <td id="LC272" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L273" class="blob-num js-line-number" data-line-number="273"></td>
+        <td id="LC273" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">int</span> ret = <span class="pl-c1">0</span>;</td>
+      </tr>
+      <tr>
+        <td id="L274" class="blob-num js-line-number" data-line-number="274"></td>
+        <td id="LC274" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">if</span> (NR_CPUS == <span class="pl-c1">1</span>)</td>
+      </tr>
+      <tr>
+        <td id="L275" class="blob-num js-line-number" data-line-number="275"></td>
+        <td id="LC275" class="blob-code blob-code-inner js-file-line">		ret = <span class="pl-c1">sscanf</span>(buf,<span class="pl-s"><span class="pl-pds">&quot;</span><span class="pl-c1">%u</span><span class="pl-pds">&quot;</span></span>,&amp;two_phase_freq_array[<span class="pl-c1">0</span>]);</td>
+      </tr>
+      <tr>
+        <td id="L276" class="blob-num js-line-number" data-line-number="276"></td>
+        <td id="LC276" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">else</span> <span class="pl-k">if</span> (NR_CPUS == <span class="pl-c1">2</span>)</td>
+      </tr>
+      <tr>
+        <td id="L277" class="blob-num js-line-number" data-line-number="277"></td>
+        <td id="LC277" class="blob-code blob-code-inner js-file-line">		ret = <span class="pl-c1">sscanf</span>(buf,<span class="pl-s"><span class="pl-pds">&quot;</span><span class="pl-c1">%u</span>,<span class="pl-c1">%u</span><span class="pl-pds">&quot;</span></span>,&amp;two_phase_freq_array[<span class="pl-c1">0</span>],</td>
+      </tr>
+      <tr>
+        <td id="L278" class="blob-num js-line-number" data-line-number="278"></td>
+        <td id="LC278" class="blob-code blob-code-inner js-file-line">				&amp;two_phase_freq_array[<span class="pl-c1">1</span>]);</td>
+      </tr>
+      <tr>
+        <td id="L279" class="blob-num js-line-number" data-line-number="279"></td>
+        <td id="LC279" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">else</span> <span class="pl-k">if</span> (NR_CPUS == <span class="pl-c1">4</span>)</td>
+      </tr>
+      <tr>
+        <td id="L280" class="blob-num js-line-number" data-line-number="280"></td>
+        <td id="LC280" class="blob-code blob-code-inner js-file-line">		ret = <span class="pl-c1">sscanf</span>(buf, <span class="pl-s"><span class="pl-pds">&quot;</span><span class="pl-c1">%u</span>,<span class="pl-c1">%u</span>,<span class="pl-c1">%u</span>,<span class="pl-c1">%u</span><span class="pl-pds">&quot;</span></span>, &amp;two_phase_freq_array[<span class="pl-c1">0</span>],</td>
+      </tr>
+      <tr>
+        <td id="L281" class="blob-num js-line-number" data-line-number="281"></td>
+        <td id="LC281" class="blob-code blob-code-inner js-file-line">				&amp;two_phase_freq_array[<span class="pl-c1">1</span>],</td>
+      </tr>
+      <tr>
+        <td id="L282" class="blob-num js-line-number" data-line-number="282"></td>
+        <td id="LC282" class="blob-code blob-code-inner js-file-line">				&amp;two_phase_freq_array[<span class="pl-c1">2</span>],</td>
+      </tr>
+      <tr>
+        <td id="L283" class="blob-num js-line-number" data-line-number="283"></td>
+        <td id="LC283" class="blob-code blob-code-inner js-file-line">				&amp;two_phase_freq_array[<span class="pl-c1">3</span>]);</td>
+      </tr>
+      <tr>
+        <td id="L284" class="blob-num js-line-number" data-line-number="284"></td>
+        <td id="LC284" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">if</span> (ret &lt; NR_CPUS)</td>
+      </tr>
+      <tr>
+        <td id="L285" class="blob-num js-line-number" data-line-number="285"></td>
+        <td id="LC285" class="blob-code blob-code-inner js-file-line">		<span class="pl-k">return</span> -EINVAL;</td>
+      </tr>
+      <tr>
+        <td id="L286" class="blob-num js-line-number" data-line-number="286"></td>
+        <td id="LC286" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L287" class="blob-num js-line-number" data-line-number="287"></td>
+        <td id="LC287" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">return</span> count;</td>
+      </tr>
+      <tr>
+        <td id="L288" class="blob-num js-line-number" data-line-number="288"></td>
+        <td id="LC288" class="blob-code blob-code-inner js-file-line">}</td>
+      </tr>
+      <tr>
+        <td id="L289" class="blob-num js-line-number" data-line-number="289"></td>
+        <td id="LC289" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L290" class="blob-num js-line-number" data-line-number="290"></td>
+        <td id="LC290" class="blob-code blob-code-inner js-file-line"><span class="pl-k">static</span> <span class="pl-c1">ssize_t</span> <span class="pl-en">store_sampling_rate</span>(<span class="pl-k">struct</span> kobject *a, <span class="pl-k">struct</span> attribute *b,</td>
+      </tr>
+      <tr>
+        <td id="L291" class="blob-num js-line-number" data-line-number="291"></td>
+        <td id="LC291" class="blob-code blob-code-inner js-file-line">				   <span class="pl-k">const</span> <span class="pl-k">char</span> *buf, <span class="pl-c1">size_t</span> count)</td>
+      </tr>
+      <tr>
+        <td id="L292" class="blob-num js-line-number" data-line-number="292"></td>
+        <td id="LC292" class="blob-code blob-code-inner js-file-line">{</td>
+      </tr>
+      <tr>
+        <td id="L293" class="blob-num js-line-number" data-line-number="293"></td>
+        <td id="LC293" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">unsigned</span> <span class="pl-k">int</span> input;</td>
+      </tr>
+      <tr>
+        <td id="L294" class="blob-num js-line-number" data-line-number="294"></td>
+        <td id="LC294" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">int</span> ret = <span class="pl-c1">0</span>;</td>
+      </tr>
+      <tr>
+        <td id="L295" class="blob-num js-line-number" data-line-number="295"></td>
+        <td id="LC295" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">int</span> mpd = <span class="pl-c1">strcmp</span>(current-&gt;comm, <span class="pl-s"><span class="pl-pds">&quot;</span>mpdecision<span class="pl-pds">&quot;</span></span>);</td>
+      </tr>
+      <tr>
+        <td id="L296" class="blob-num js-line-number" data-line-number="296"></td>
+        <td id="LC296" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L297" class="blob-num js-line-number" data-line-number="297"></td>
+        <td id="LC297" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">if</span> (mpd == <span class="pl-c1">0</span>)</td>
+      </tr>
+      <tr>
+        <td id="L298" class="blob-num js-line-number" data-line-number="298"></td>
+        <td id="LC298" class="blob-code blob-code-inner js-file-line">		<span class="pl-k">return</span> ret;</td>
+      </tr>
+      <tr>
+        <td id="L299" class="blob-num js-line-number" data-line-number="299"></td>
+        <td id="LC299" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L300" class="blob-num js-line-number" data-line-number="300"></td>
+        <td id="LC300" class="blob-code blob-code-inner js-file-line">	ret = <span class="pl-c1">sscanf</span>(buf, <span class="pl-s"><span class="pl-pds">&quot;</span><span class="pl-c1">%u</span><span class="pl-pds">&quot;</span></span>, &amp;input);</td>
+      </tr>
+      <tr>
+        <td id="L301" class="blob-num js-line-number" data-line-number="301"></td>
+        <td id="LC301" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">if</span> (ret != <span class="pl-c1">1</span>)</td>
+      </tr>
+      <tr>
+        <td id="L302" class="blob-num js-line-number" data-line-number="302"></td>
+        <td id="LC302" class="blob-code blob-code-inner js-file-line">		<span class="pl-k">return</span> -EINVAL;</td>
+      </tr>
+      <tr>
+        <td id="L303" class="blob-num js-line-number" data-line-number="303"></td>
+        <td id="LC303" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L304" class="blob-num js-line-number" data-line-number="304"></td>
+        <td id="LC304" class="blob-code blob-code-inner js-file-line">	dbs_tuners_ins.<span class="pl-smi">sampling_rate</span> = <span class="pl-c1">max</span>(input, min_sampling_rate);</td>
+      </tr>
+      <tr>
+        <td id="L305" class="blob-num js-line-number" data-line-number="305"></td>
+        <td id="LC305" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L306" class="blob-num js-line-number" data-line-number="306"></td>
+        <td id="LC306" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">return</span> count;</td>
+      </tr>
+      <tr>
+        <td id="L307" class="blob-num js-line-number" data-line-number="307"></td>
+        <td id="LC307" class="blob-code blob-code-inner js-file-line">}</td>
+      </tr>
+      <tr>
+        <td id="L308" class="blob-num js-line-number" data-line-number="308"></td>
+        <td id="LC308" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L309" class="blob-num js-line-number" data-line-number="309"></td>
+        <td id="LC309" class="blob-code blob-code-inner js-file-line"><span class="pl-k">static</span> <span class="pl-c1">ssize_t</span> <span class="pl-en">store_sync_freq</span>(<span class="pl-k">struct</span> kobject *a, <span class="pl-k">struct</span> attribute *b,</td>
+      </tr>
+      <tr>
+        <td id="L310" class="blob-num js-line-number" data-line-number="310"></td>
+        <td id="LC310" class="blob-code blob-code-inner js-file-line">				   <span class="pl-k">const</span> <span class="pl-k">char</span> *buf, <span class="pl-c1">size_t</span> count)</td>
+      </tr>
+      <tr>
+        <td id="L311" class="blob-num js-line-number" data-line-number="311"></td>
+        <td id="LC311" class="blob-code blob-code-inner js-file-line">{</td>
+      </tr>
+      <tr>
+        <td id="L312" class="blob-num js-line-number" data-line-number="312"></td>
+        <td id="LC312" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">unsigned</span> <span class="pl-k">int</span> input;</td>
+      </tr>
+      <tr>
+        <td id="L313" class="blob-num js-line-number" data-line-number="313"></td>
+        <td id="LC313" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">int</span> ret = <span class="pl-c1">0</span>;</td>
+      </tr>
+      <tr>
+        <td id="L314" class="blob-num js-line-number" data-line-number="314"></td>
+        <td id="LC314" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">int</span> mpd = <span class="pl-c1">strcmp</span>(current-&gt;comm, <span class="pl-s"><span class="pl-pds">&quot;</span>mpdecision<span class="pl-pds">&quot;</span></span>);</td>
+      </tr>
+      <tr>
+        <td id="L315" class="blob-num js-line-number" data-line-number="315"></td>
+        <td id="LC315" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L316" class="blob-num js-line-number" data-line-number="316"></td>
+        <td id="LC316" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">if</span> (mpd == <span class="pl-c1">0</span>)</td>
+      </tr>
+      <tr>
+        <td id="L317" class="blob-num js-line-number" data-line-number="317"></td>
+        <td id="LC317" class="blob-code blob-code-inner js-file-line">		<span class="pl-k">return</span> ret;</td>
+      </tr>
+      <tr>
+        <td id="L318" class="blob-num js-line-number" data-line-number="318"></td>
+        <td id="LC318" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L319" class="blob-num js-line-number" data-line-number="319"></td>
+        <td id="LC319" class="blob-code blob-code-inner js-file-line">	ret = <span class="pl-c1">sscanf</span>(buf, <span class="pl-s"><span class="pl-pds">&quot;</span><span class="pl-c1">%u</span><span class="pl-pds">&quot;</span></span>, &amp;input);</td>
+      </tr>
+      <tr>
+        <td id="L320" class="blob-num js-line-number" data-line-number="320"></td>
+        <td id="LC320" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">if</span> (ret != <span class="pl-c1">1</span>)</td>
+      </tr>
+      <tr>
+        <td id="L321" class="blob-num js-line-number" data-line-number="321"></td>
+        <td id="LC321" class="blob-code blob-code-inner js-file-line">		<span class="pl-k">return</span> -EINVAL;</td>
+      </tr>
+      <tr>
+        <td id="L322" class="blob-num js-line-number" data-line-number="322"></td>
+        <td id="LC322" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L323" class="blob-num js-line-number" data-line-number="323"></td>
+        <td id="LC323" class="blob-code blob-code-inner js-file-line">	dbs_tuners_ins.<span class="pl-smi">sync_freq</span> = input;</td>
+      </tr>
+      <tr>
+        <td id="L324" class="blob-num js-line-number" data-line-number="324"></td>
+        <td id="LC324" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L325" class="blob-num js-line-number" data-line-number="325"></td>
+        <td id="LC325" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">return</span> count;</td>
+      </tr>
+      <tr>
+        <td id="L326" class="blob-num js-line-number" data-line-number="326"></td>
+        <td id="LC326" class="blob-code blob-code-inner js-file-line">}</td>
+      </tr>
+      <tr>
+        <td id="L327" class="blob-num js-line-number" data-line-number="327"></td>
+        <td id="LC327" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L328" class="blob-num js-line-number" data-line-number="328"></td>
+        <td id="LC328" class="blob-code blob-code-inner js-file-line"><span class="pl-k">static</span> <span class="pl-c1">ssize_t</span> <span class="pl-en">store_optimal_freq</span>(<span class="pl-k">struct</span> kobject *a, <span class="pl-k">struct</span> attribute *b,</td>
+      </tr>
+      <tr>
+        <td id="L329" class="blob-num js-line-number" data-line-number="329"></td>
+        <td id="LC329" class="blob-code blob-code-inner js-file-line">				   <span class="pl-k">const</span> <span class="pl-k">char</span> *buf, <span class="pl-c1">size_t</span> count)</td>
+      </tr>
+      <tr>
+        <td id="L330" class="blob-num js-line-number" data-line-number="330"></td>
+        <td id="LC330" class="blob-code blob-code-inner js-file-line">{</td>
+      </tr>
+      <tr>
+        <td id="L331" class="blob-num js-line-number" data-line-number="331"></td>
+        <td id="LC331" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">unsigned</span> <span class="pl-k">int</span> input;</td>
+      </tr>
+      <tr>
+        <td id="L332" class="blob-num js-line-number" data-line-number="332"></td>
+        <td id="LC332" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">int</span> ret = <span class="pl-c1">0</span>;</td>
+      </tr>
+      <tr>
+        <td id="L333" class="blob-num js-line-number" data-line-number="333"></td>
+        <td id="LC333" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">int</span> mpd = <span class="pl-c1">strcmp</span>(current-&gt;comm, <span class="pl-s"><span class="pl-pds">&quot;</span>mpdecision<span class="pl-pds">&quot;</span></span>);</td>
+      </tr>
+      <tr>
+        <td id="L334" class="blob-num js-line-number" data-line-number="334"></td>
+        <td id="LC334" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L335" class="blob-num js-line-number" data-line-number="335"></td>
+        <td id="LC335" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">if</span> (mpd == <span class="pl-c1">0</span>)</td>
+      </tr>
+      <tr>
+        <td id="L336" class="blob-num js-line-number" data-line-number="336"></td>
+        <td id="LC336" class="blob-code blob-code-inner js-file-line">		<span class="pl-k">return</span> ret;</td>
+      </tr>
+      <tr>
+        <td id="L337" class="blob-num js-line-number" data-line-number="337"></td>
+        <td id="LC337" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L338" class="blob-num js-line-number" data-line-number="338"></td>
+        <td id="LC338" class="blob-code blob-code-inner js-file-line">	ret = <span class="pl-c1">sscanf</span>(buf, <span class="pl-s"><span class="pl-pds">&quot;</span><span class="pl-c1">%u</span><span class="pl-pds">&quot;</span></span>, &amp;input);</td>
+      </tr>
+      <tr>
+        <td id="L339" class="blob-num js-line-number" data-line-number="339"></td>
+        <td id="LC339" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">if</span> (ret != <span class="pl-c1">1</span>)</td>
+      </tr>
+      <tr>
+        <td id="L340" class="blob-num js-line-number" data-line-number="340"></td>
+        <td id="LC340" class="blob-code blob-code-inner js-file-line">		<span class="pl-k">return</span> -EINVAL;</td>
+      </tr>
+      <tr>
+        <td id="L341" class="blob-num js-line-number" data-line-number="341"></td>
+        <td id="LC341" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L342" class="blob-num js-line-number" data-line-number="342"></td>
+        <td id="LC342" class="blob-code blob-code-inner js-file-line">	dbs_tuners_ins.<span class="pl-smi">optimal_freq</span> = input;</td>
+      </tr>
+      <tr>
+        <td id="L343" class="blob-num js-line-number" data-line-number="343"></td>
+        <td id="LC343" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L344" class="blob-num js-line-number" data-line-number="344"></td>
+        <td id="LC344" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">return</span> count;</td>
+      </tr>
+      <tr>
+        <td id="L345" class="blob-num js-line-number" data-line-number="345"></td>
+        <td id="LC345" class="blob-code blob-code-inner js-file-line">}</td>
+      </tr>
+      <tr>
+        <td id="L346" class="blob-num js-line-number" data-line-number="346"></td>
+        <td id="LC346" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L347" class="blob-num js-line-number" data-line-number="347"></td>
+        <td id="LC347" class="blob-code blob-code-inner js-file-line"><span class="pl-k">static</span> <span class="pl-c1">ssize_t</span> <span class="pl-en">store_up_threshold</span>(<span class="pl-k">struct</span> kobject *a, <span class="pl-k">struct</span> attribute *b,</td>
+      </tr>
+      <tr>
+        <td id="L348" class="blob-num js-line-number" data-line-number="348"></td>
+        <td id="LC348" class="blob-code blob-code-inner js-file-line">				  <span class="pl-k">const</span> <span class="pl-k">char</span> *buf, <span class="pl-c1">size_t</span> count)</td>
+      </tr>
+      <tr>
+        <td id="L349" class="blob-num js-line-number" data-line-number="349"></td>
+        <td id="LC349" class="blob-code blob-code-inner js-file-line">{</td>
+      </tr>
+      <tr>
+        <td id="L350" class="blob-num js-line-number" data-line-number="350"></td>
+        <td id="LC350" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">unsigned</span> <span class="pl-k">int</span> input;</td>
+      </tr>
+      <tr>
+        <td id="L351" class="blob-num js-line-number" data-line-number="351"></td>
+        <td id="LC351" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">int</span> ret;</td>
+      </tr>
+      <tr>
+        <td id="L352" class="blob-num js-line-number" data-line-number="352"></td>
+        <td id="LC352" class="blob-code blob-code-inner js-file-line">	ret = <span class="pl-c1">sscanf</span>(buf, <span class="pl-s"><span class="pl-pds">&quot;</span><span class="pl-c1">%u</span><span class="pl-pds">&quot;</span></span>, &amp;input);</td>
+      </tr>
+      <tr>
+        <td id="L353" class="blob-num js-line-number" data-line-number="353"></td>
+        <td id="LC353" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L354" class="blob-num js-line-number" data-line-number="354"></td>
+        <td id="LC354" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">if</span> (ret != <span class="pl-c1">1</span> || input &gt; MAX_FREQUENCY_UP_THRESHOLD ||</td>
+      </tr>
+      <tr>
+        <td id="L355" class="blob-num js-line-number" data-line-number="355"></td>
+        <td id="LC355" class="blob-code blob-code-inner js-file-line">			input &lt; MIN_FREQUENCY_UP_THRESHOLD) {</td>
+      </tr>
+      <tr>
+        <td id="L356" class="blob-num js-line-number" data-line-number="356"></td>
+        <td id="LC356" class="blob-code blob-code-inner js-file-line">		<span class="pl-k">return</span> -EINVAL;</td>
+      </tr>
+      <tr>
+        <td id="L357" class="blob-num js-line-number" data-line-number="357"></td>
+        <td id="LC357" class="blob-code blob-code-inner js-file-line">	}</td>
+      </tr>
+      <tr>
+        <td id="L358" class="blob-num js-line-number" data-line-number="358"></td>
+        <td id="LC358" class="blob-code blob-code-inner js-file-line">	dbs_tuners_ins.<span class="pl-smi">up_threshold</span> = input;</td>
+      </tr>
+      <tr>
+        <td id="L359" class="blob-num js-line-number" data-line-number="359"></td>
+        <td id="LC359" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L360" class="blob-num js-line-number" data-line-number="360"></td>
+        <td id="LC360" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">return</span> count;</td>
+      </tr>
+      <tr>
+        <td id="L361" class="blob-num js-line-number" data-line-number="361"></td>
+        <td id="LC361" class="blob-code blob-code-inner js-file-line">}</td>
+      </tr>
+      <tr>
+        <td id="L362" class="blob-num js-line-number" data-line-number="362"></td>
+        <td id="LC362" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L363" class="blob-num js-line-number" data-line-number="363"></td>
+        <td id="LC363" class="blob-code blob-code-inner js-file-line"><span class="pl-k">static</span> <span class="pl-c1">ssize_t</span> <span class="pl-en">store_up_threshold_multi_core</span>(<span class="pl-k">struct</span> kobject *a,</td>
+      </tr>
+      <tr>
+        <td id="L364" class="blob-num js-line-number" data-line-number="364"></td>
+        <td id="LC364" class="blob-code blob-code-inner js-file-line">			<span class="pl-k">struct</span> attribute *b, <span class="pl-k">const</span> <span class="pl-k">char</span> *buf, <span class="pl-c1">size_t</span> count)</td>
+      </tr>
+      <tr>
+        <td id="L365" class="blob-num js-line-number" data-line-number="365"></td>
+        <td id="LC365" class="blob-code blob-code-inner js-file-line">{</td>
+      </tr>
+      <tr>
+        <td id="L366" class="blob-num js-line-number" data-line-number="366"></td>
+        <td id="LC366" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">unsigned</span> <span class="pl-k">int</span> input;</td>
+      </tr>
+      <tr>
+        <td id="L367" class="blob-num js-line-number" data-line-number="367"></td>
+        <td id="LC367" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">int</span> ret;</td>
+      </tr>
+      <tr>
+        <td id="L368" class="blob-num js-line-number" data-line-number="368"></td>
+        <td id="LC368" class="blob-code blob-code-inner js-file-line">	ret = <span class="pl-c1">sscanf</span>(buf, <span class="pl-s"><span class="pl-pds">&quot;</span><span class="pl-c1">%u</span><span class="pl-pds">&quot;</span></span>, &amp;input);</td>
+      </tr>
+      <tr>
+        <td id="L369" class="blob-num js-line-number" data-line-number="369"></td>
+        <td id="LC369" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L370" class="blob-num js-line-number" data-line-number="370"></td>
+        <td id="LC370" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">if</span> (ret != <span class="pl-c1">1</span> || input &gt; MAX_FREQUENCY_UP_THRESHOLD ||</td>
+      </tr>
+      <tr>
+        <td id="L371" class="blob-num js-line-number" data-line-number="371"></td>
+        <td id="LC371" class="blob-code blob-code-inner js-file-line">			input &lt; MIN_FREQUENCY_UP_THRESHOLD) {</td>
+      </tr>
+      <tr>
+        <td id="L372" class="blob-num js-line-number" data-line-number="372"></td>
+        <td id="LC372" class="blob-code blob-code-inner js-file-line">		<span class="pl-k">return</span> -EINVAL;</td>
+      </tr>
+      <tr>
+        <td id="L373" class="blob-num js-line-number" data-line-number="373"></td>
+        <td id="LC373" class="blob-code blob-code-inner js-file-line">	}</td>
+      </tr>
+      <tr>
+        <td id="L374" class="blob-num js-line-number" data-line-number="374"></td>
+        <td id="LC374" class="blob-code blob-code-inner js-file-line">	dbs_tuners_ins.<span class="pl-smi">up_threshold_multi_core</span> = input;</td>
+      </tr>
+      <tr>
+        <td id="L375" class="blob-num js-line-number" data-line-number="375"></td>
+        <td id="LC375" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L376" class="blob-num js-line-number" data-line-number="376"></td>
+        <td id="LC376" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">return</span> count;</td>
+      </tr>
+      <tr>
+        <td id="L377" class="blob-num js-line-number" data-line-number="377"></td>
+        <td id="LC377" class="blob-code blob-code-inner js-file-line">}</td>
+      </tr>
+      <tr>
+        <td id="L378" class="blob-num js-line-number" data-line-number="378"></td>
+        <td id="LC378" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L379" class="blob-num js-line-number" data-line-number="379"></td>
+        <td id="LC379" class="blob-code blob-code-inner js-file-line"><span class="pl-k">static</span> <span class="pl-c1">ssize_t</span> <span class="pl-en">store_up_threshold_any_cpu_load</span>(<span class="pl-k">struct</span> kobject *a,</td>
+      </tr>
+      <tr>
+        <td id="L380" class="blob-num js-line-number" data-line-number="380"></td>
+        <td id="LC380" class="blob-code blob-code-inner js-file-line">			<span class="pl-k">struct</span> attribute *b, <span class="pl-k">const</span> <span class="pl-k">char</span> *buf, <span class="pl-c1">size_t</span> count)</td>
+      </tr>
+      <tr>
+        <td id="L381" class="blob-num js-line-number" data-line-number="381"></td>
+        <td id="LC381" class="blob-code blob-code-inner js-file-line">{</td>
+      </tr>
+      <tr>
+        <td id="L382" class="blob-num js-line-number" data-line-number="382"></td>
+        <td id="LC382" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">unsigned</span> <span class="pl-k">int</span> input;</td>
+      </tr>
+      <tr>
+        <td id="L383" class="blob-num js-line-number" data-line-number="383"></td>
+        <td id="LC383" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">int</span> ret;</td>
+      </tr>
+      <tr>
+        <td id="L384" class="blob-num js-line-number" data-line-number="384"></td>
+        <td id="LC384" class="blob-code blob-code-inner js-file-line">	ret = <span class="pl-c1">sscanf</span>(buf, <span class="pl-s"><span class="pl-pds">&quot;</span><span class="pl-c1">%u</span><span class="pl-pds">&quot;</span></span>, &amp;input);</td>
+      </tr>
+      <tr>
+        <td id="L385" class="blob-num js-line-number" data-line-number="385"></td>
+        <td id="LC385" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L386" class="blob-num js-line-number" data-line-number="386"></td>
+        <td id="LC386" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">if</span> (ret != <span class="pl-c1">1</span> || input &gt; MAX_FREQUENCY_UP_THRESHOLD ||</td>
+      </tr>
+      <tr>
+        <td id="L387" class="blob-num js-line-number" data-line-number="387"></td>
+        <td id="LC387" class="blob-code blob-code-inner js-file-line">			input &lt; MIN_FREQUENCY_UP_THRESHOLD) {</td>
+      </tr>
+      <tr>
+        <td id="L388" class="blob-num js-line-number" data-line-number="388"></td>
+        <td id="LC388" class="blob-code blob-code-inner js-file-line">		<span class="pl-k">return</span> -EINVAL;</td>
+      </tr>
+      <tr>
+        <td id="L389" class="blob-num js-line-number" data-line-number="389"></td>
+        <td id="LC389" class="blob-code blob-code-inner js-file-line">	}</td>
+      </tr>
+      <tr>
+        <td id="L390" class="blob-num js-line-number" data-line-number="390"></td>
+        <td id="LC390" class="blob-code blob-code-inner js-file-line">	dbs_tuners_ins.<span class="pl-smi">up_threshold_any_cpu_load</span> = input;</td>
+      </tr>
+      <tr>
+        <td id="L391" class="blob-num js-line-number" data-line-number="391"></td>
+        <td id="LC391" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L392" class="blob-num js-line-number" data-line-number="392"></td>
+        <td id="LC392" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">return</span> count;</td>
+      </tr>
+      <tr>
+        <td id="L393" class="blob-num js-line-number" data-line-number="393"></td>
+        <td id="LC393" class="blob-code blob-code-inner js-file-line">}</td>
+      </tr>
+      <tr>
+        <td id="L394" class="blob-num js-line-number" data-line-number="394"></td>
+        <td id="LC394" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L395" class="blob-num js-line-number" data-line-number="395"></td>
+        <td id="LC395" class="blob-code blob-code-inner js-file-line"><span class="pl-k">static</span> <span class="pl-c1">ssize_t</span> <span class="pl-en">store_sampling_down_factor</span>(<span class="pl-k">struct</span> kobject *a,</td>
+      </tr>
+      <tr>
+        <td id="L396" class="blob-num js-line-number" data-line-number="396"></td>
+        <td id="LC396" class="blob-code blob-code-inner js-file-line">			<span class="pl-k">struct</span> attribute *b, <span class="pl-k">const</span> <span class="pl-k">char</span> *buf, <span class="pl-c1">size_t</span> count)</td>
+      </tr>
+      <tr>
+        <td id="L397" class="blob-num js-line-number" data-line-number="397"></td>
+        <td id="LC397" class="blob-code blob-code-inner js-file-line">{</td>
+      </tr>
+      <tr>
+        <td id="L398" class="blob-num js-line-number" data-line-number="398"></td>
+        <td id="LC398" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">unsigned</span> <span class="pl-k">int</span> input, j;</td>
+      </tr>
+      <tr>
+        <td id="L399" class="blob-num js-line-number" data-line-number="399"></td>
+        <td id="LC399" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">int</span> ret;</td>
+      </tr>
+      <tr>
+        <td id="L400" class="blob-num js-line-number" data-line-number="400"></td>
+        <td id="LC400" class="blob-code blob-code-inner js-file-line">	ret = <span class="pl-c1">sscanf</span>(buf, <span class="pl-s"><span class="pl-pds">&quot;</span><span class="pl-c1">%u</span><span class="pl-pds">&quot;</span></span>, &amp;input);</td>
+      </tr>
+      <tr>
+        <td id="L401" class="blob-num js-line-number" data-line-number="401"></td>
+        <td id="LC401" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L402" class="blob-num js-line-number" data-line-number="402"></td>
+        <td id="LC402" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">if</span> (ret != <span class="pl-c1">1</span> || input &gt; MAX_SAMPLING_DOWN_FACTOR || input &lt; <span class="pl-c1">1</span>)</td>
+      </tr>
+      <tr>
+        <td id="L403" class="blob-num js-line-number" data-line-number="403"></td>
+        <td id="LC403" class="blob-code blob-code-inner js-file-line">		<span class="pl-k">return</span> -EINVAL;</td>
+      </tr>
+      <tr>
+        <td id="L404" class="blob-num js-line-number" data-line-number="404"></td>
+        <td id="LC404" class="blob-code blob-code-inner js-file-line">	dbs_tuners_ins.<span class="pl-smi">sampling_down_factor</span> = input;</td>
+      </tr>
+      <tr>
+        <td id="L405" class="blob-num js-line-number" data-line-number="405"></td>
+        <td id="LC405" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L406" class="blob-num js-line-number" data-line-number="406"></td>
+        <td id="LC406" class="blob-code blob-code-inner js-file-line">	<span class="pl-c">/* Reset down sampling multiplier in case it was active */</span></td>
+      </tr>
+      <tr>
+        <td id="L407" class="blob-num js-line-number" data-line-number="407"></td>
+        <td id="LC407" class="blob-code blob-code-inner js-file-line">	<span class="pl-c1">for_each_online_cpu</span>(j) {</td>
+      </tr>
+      <tr>
+        <td id="L408" class="blob-num js-line-number" data-line-number="408"></td>
+        <td id="LC408" class="blob-code blob-code-inner js-file-line">		<span class="pl-k">struct</span> cpu_dbs_info_s *dbs_info;</td>
+      </tr>
+      <tr>
+        <td id="L409" class="blob-num js-line-number" data-line-number="409"></td>
+        <td id="LC409" class="blob-code blob-code-inner js-file-line">		dbs_info = &amp;<span class="pl-c1">per_cpu</span>(id_cpu_dbs_info, j);</td>
+      </tr>
+      <tr>
+        <td id="L410" class="blob-num js-line-number" data-line-number="410"></td>
+        <td id="LC410" class="blob-code blob-code-inner js-file-line">		dbs_info-&gt;rate_mult = <span class="pl-c1">1</span>;</td>
+      </tr>
+      <tr>
+        <td id="L411" class="blob-num js-line-number" data-line-number="411"></td>
+        <td id="LC411" class="blob-code blob-code-inner js-file-line">	}</td>
+      </tr>
+      <tr>
+        <td id="L412" class="blob-num js-line-number" data-line-number="412"></td>
+        <td id="LC412" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">return</span> count;</td>
+      </tr>
+      <tr>
+        <td id="L413" class="blob-num js-line-number" data-line-number="413"></td>
+        <td id="LC413" class="blob-code blob-code-inner js-file-line">}</td>
+      </tr>
+      <tr>
+        <td id="L414" class="blob-num js-line-number" data-line-number="414"></td>
+        <td id="LC414" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L415" class="blob-num js-line-number" data-line-number="415"></td>
+        <td id="LC415" class="blob-code blob-code-inner js-file-line"><span class="pl-c">/* PATCH : SMART_UP */</span></td>
+      </tr>
+      <tr>
+        <td id="L416" class="blob-num js-line-number" data-line-number="416"></td>
+        <td id="LC416" class="blob-code blob-code-inner js-file-line">#<span class="pl-k">if</span> defined(SMART_UP_SLOW_UP_AT_HIGH_FREQ)</td>
+      </tr>
+      <tr>
+        <td id="L417" class="blob-num js-line-number" data-line-number="417"></td>
+        <td id="LC417" class="blob-code blob-code-inner js-file-line"><span class="pl-k">static</span> <span class="pl-k">void</span> <span class="pl-en">reset_hist</span>(history_load *hist_load)</td>
+      </tr>
+      <tr>
+        <td id="L418" class="blob-num js-line-number" data-line-number="418"></td>
+        <td id="LC418" class="blob-code blob-code-inner js-file-line">{</td>
+      </tr>
+      <tr>
+        <td id="L419" class="blob-num js-line-number" data-line-number="419"></td>
+        <td id="LC419" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">int</span> i;</td>
+      </tr>
+      <tr>
+        <td id="L420" class="blob-num js-line-number" data-line-number="420"></td>
+        <td id="LC420" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L421" class="blob-num js-line-number" data-line-number="421"></td>
+        <td id="LC421" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">for</span> (i = <span class="pl-c1">0</span>; i &lt; SUP_SLOW_UP_DUR ; i++)</td>
+      </tr>
+      <tr>
+        <td id="L422" class="blob-num js-line-number" data-line-number="422"></td>
+        <td id="LC422" class="blob-code blob-code-inner js-file-line">		hist_load-&gt;hist_max_load[i] = <span class="pl-c1">0</span>;</td>
+      </tr>
+      <tr>
+        <td id="L423" class="blob-num js-line-number" data-line-number="423"></td>
+        <td id="LC423" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L424" class="blob-num js-line-number" data-line-number="424"></td>
+        <td id="LC424" class="blob-code blob-code-inner js-file-line">	hist_load-&gt;hist_load_cnt = <span class="pl-c1">0</span>;</td>
+      </tr>
+      <tr>
+        <td id="L425" class="blob-num js-line-number" data-line-number="425"></td>
+        <td id="LC425" class="blob-code blob-code-inner js-file-line">}</td>
+      </tr>
+      <tr>
+        <td id="L426" class="blob-num js-line-number" data-line-number="426"></td>
+        <td id="LC426" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L427" class="blob-num js-line-number" data-line-number="427"></td>
+        <td id="LC427" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L428" class="blob-num js-line-number" data-line-number="428"></td>
+        <td id="LC428" class="blob-code blob-code-inner js-file-line"><span class="pl-k">static</span> <span class="pl-k">void</span> <span class="pl-en">reset_hist_high</span>(history_load_high *hist_load)</td>
+      </tr>
+      <tr>
+        <td id="L429" class="blob-num js-line-number" data-line-number="429"></td>
+        <td id="LC429" class="blob-code blob-code-inner js-file-line">{	<span class="pl-k">int</span> i;</td>
+      </tr>
+      <tr>
+        <td id="L430" class="blob-num js-line-number" data-line-number="430"></td>
+        <td id="LC430" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L431" class="blob-num js-line-number" data-line-number="431"></td>
+        <td id="LC431" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">for</span> (i = <span class="pl-c1">0</span>; i &lt; SUP_HIGH_SLOW_UP_DUR ; i++)</td>
+      </tr>
+      <tr>
+        <td id="L432" class="blob-num js-line-number" data-line-number="432"></td>
+        <td id="LC432" class="blob-code blob-code-inner js-file-line">		hist_load-&gt;hist_max_load[i] = <span class="pl-c1">0</span>;</td>
+      </tr>
+      <tr>
+        <td id="L433" class="blob-num js-line-number" data-line-number="433"></td>
+        <td id="LC433" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L434" class="blob-num js-line-number" data-line-number="434"></td>
+        <td id="LC434" class="blob-code blob-code-inner js-file-line">	hist_load-&gt;hist_load_cnt = <span class="pl-c1">0</span>;</td>
+      </tr>
+      <tr>
+        <td id="L435" class="blob-num js-line-number" data-line-number="435"></td>
+        <td id="LC435" class="blob-code blob-code-inner js-file-line">}</td>
+      </tr>
+      <tr>
+        <td id="L436" class="blob-num js-line-number" data-line-number="436"></td>
+        <td id="LC436" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L437" class="blob-num js-line-number" data-line-number="437"></td>
+        <td id="LC437" class="blob-code blob-code-inner js-file-line">#<span class="pl-k">endif</span></td>
+      </tr>
+      <tr>
+        <td id="L438" class="blob-num js-line-number" data-line-number="438"></td>
+        <td id="LC438" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L439" class="blob-num js-line-number" data-line-number="439"></td>
+        <td id="LC439" class="blob-code blob-code-inner js-file-line"><span class="pl-c">/* 20130711 smart_up */</span></td>
+      </tr>
+      <tr>
+        <td id="L440" class="blob-num js-line-number" data-line-number="440"></td>
+        <td id="LC440" class="blob-code blob-code-inner js-file-line"><span class="pl-k">static</span> <span class="pl-c1">ssize_t</span> <span class="pl-en">store_smart_up</span>(<span class="pl-k">struct</span> kobject *a, <span class="pl-k">struct</span> attribute *b,</td>
+      </tr>
+      <tr>
+        <td id="L441" class="blob-num js-line-number" data-line-number="441"></td>
+        <td id="LC441" class="blob-code blob-code-inner js-file-line">				   <span class="pl-k">const</span> <span class="pl-k">char</span> *buf, <span class="pl-c1">size_t</span> count)</td>
+      </tr>
+      <tr>
+        <td id="L442" class="blob-num js-line-number" data-line-number="442"></td>
+        <td id="LC442" class="blob-code blob-code-inner js-file-line">{</td>
+      </tr>
+      <tr>
+        <td id="L443" class="blob-num js-line-number" data-line-number="443"></td>
+        <td id="LC443" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">unsigned</span> <span class="pl-k">int</span> i, input;</td>
+      </tr>
+      <tr>
+        <td id="L444" class="blob-num js-line-number" data-line-number="444"></td>
+        <td id="LC444" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">int</span> ret;</td>
+      </tr>
+      <tr>
+        <td id="L445" class="blob-num js-line-number" data-line-number="445"></td>
+        <td id="LC445" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L446" class="blob-num js-line-number" data-line-number="446"></td>
+        <td id="LC446" class="blob-code blob-code-inner js-file-line">	ret = <span class="pl-c1">sscanf</span>(buf, <span class="pl-s"><span class="pl-pds">&quot;</span><span class="pl-c1">%u</span><span class="pl-pds">&quot;</span></span>, &amp;input);</td>
+      </tr>
+      <tr>
+        <td id="L447" class="blob-num js-line-number" data-line-number="447"></td>
+        <td id="LC447" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">if</span> (ret != <span class="pl-c1">1</span>)</td>
+      </tr>
+      <tr>
+        <td id="L448" class="blob-num js-line-number" data-line-number="448"></td>
+        <td id="LC448" class="blob-code blob-code-inner js-file-line">		<span class="pl-k">return</span> -EINVAL;</td>
+      </tr>
+      <tr>
+        <td id="L449" class="blob-num js-line-number" data-line-number="449"></td>
+        <td id="LC449" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">if</span> (input &gt; <span class="pl-c1">1</span>) {</td>
+      </tr>
+      <tr>
+        <td id="L450" class="blob-num js-line-number" data-line-number="450"></td>
+        <td id="LC450" class="blob-code blob-code-inner js-file-line">		input = <span class="pl-c1">1</span>;</td>
+      </tr>
+      <tr>
+        <td id="L451" class="blob-num js-line-number" data-line-number="451"></td>
+        <td id="LC451" class="blob-code blob-code-inner js-file-line">	} <span class="pl-k">else</span> <span class="pl-k">if</span> (input &lt; <span class="pl-c1">0</span>) {</td>
+      </tr>
+      <tr>
+        <td id="L452" class="blob-num js-line-number" data-line-number="452"></td>
+        <td id="LC452" class="blob-code blob-code-inner js-file-line">		input = <span class="pl-c1">0</span>;</td>
+      </tr>
+      <tr>
+        <td id="L453" class="blob-num js-line-number" data-line-number="453"></td>
+        <td id="LC453" class="blob-code blob-code-inner js-file-line">	}</td>
+      </tr>
+      <tr>
+        <td id="L454" class="blob-num js-line-number" data-line-number="454"></td>
+        <td id="LC454" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L455" class="blob-num js-line-number" data-line-number="455"></td>
+        <td id="LC455" class="blob-code blob-code-inner js-file-line">	<span class="pl-c">/* buffer reset */</span></td>
+      </tr>
+      <tr>
+        <td id="L456" class="blob-num js-line-number" data-line-number="456"></td>
+        <td id="LC456" class="blob-code blob-code-inner js-file-line">	<span class="pl-c1">for_each_online_cpu</span>(i) {</td>
+      </tr>
+      <tr>
+        <td id="L457" class="blob-num js-line-number" data-line-number="457"></td>
+        <td id="LC457" class="blob-code blob-code-inner js-file-line">		<span class="pl-c1">reset_hist</span>(&amp;hist_load[i]);</td>
+      </tr>
+      <tr>
+        <td id="L458" class="blob-num js-line-number" data-line-number="458"></td>
+        <td id="LC458" class="blob-code blob-code-inner js-file-line">		<span class="pl-c1">reset_hist_high</span>(&amp;hist_load_high[i]);</td>
+      </tr>
+      <tr>
+        <td id="L459" class="blob-num js-line-number" data-line-number="459"></td>
+        <td id="LC459" class="blob-code blob-code-inner js-file-line">	}</td>
+      </tr>
+      <tr>
+        <td id="L460" class="blob-num js-line-number" data-line-number="460"></td>
+        <td id="LC460" class="blob-code blob-code-inner js-file-line">	dbs_tuners_ins.<span class="pl-smi">smart_up</span> = input;</td>
+      </tr>
+      <tr>
+        <td id="L461" class="blob-num js-line-number" data-line-number="461"></td>
+        <td id="LC461" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L462" class="blob-num js-line-number" data-line-number="462"></td>
+        <td id="LC462" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">return</span> count;</td>
+      </tr>
+      <tr>
+        <td id="L463" class="blob-num js-line-number" data-line-number="463"></td>
+        <td id="LC463" class="blob-code blob-code-inner js-file-line">}</td>
+      </tr>
+      <tr>
+        <td id="L464" class="blob-num js-line-number" data-line-number="464"></td>
+        <td id="LC464" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L465" class="blob-num js-line-number" data-line-number="465"></td>
+        <td id="LC465" class="blob-code blob-code-inner js-file-line"><span class="pl-k">static</span> <span class="pl-c1">ssize_t</span> <span class="pl-en">store_smart_slow_up_load</span>(<span class="pl-k">struct</span> kobject *a, <span class="pl-k">struct</span> attribute *b,</td>
+      </tr>
+      <tr>
+        <td id="L466" class="blob-num js-line-number" data-line-number="466"></td>
+        <td id="LC466" class="blob-code blob-code-inner js-file-line">				   <span class="pl-k">const</span> <span class="pl-k">char</span> *buf, <span class="pl-c1">size_t</span> count)</td>
+      </tr>
+      <tr>
+        <td id="L467" class="blob-num js-line-number" data-line-number="467"></td>
+        <td id="LC467" class="blob-code blob-code-inner js-file-line">{</td>
+      </tr>
+      <tr>
+        <td id="L468" class="blob-num js-line-number" data-line-number="468"></td>
+        <td id="LC468" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">unsigned</span> <span class="pl-k">int</span> i, input;</td>
+      </tr>
+      <tr>
+        <td id="L469" class="blob-num js-line-number" data-line-number="469"></td>
+        <td id="LC469" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">int</span> ret;</td>
+      </tr>
+      <tr>
+        <td id="L470" class="blob-num js-line-number" data-line-number="470"></td>
+        <td id="LC470" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L471" class="blob-num js-line-number" data-line-number="471"></td>
+        <td id="LC471" class="blob-code blob-code-inner js-file-line">	ret = <span class="pl-c1">sscanf</span>(buf, <span class="pl-s"><span class="pl-pds">&quot;</span><span class="pl-c1">%u</span><span class="pl-pds">&quot;</span></span>, &amp;input);</td>
+      </tr>
+      <tr>
+        <td id="L472" class="blob-num js-line-number" data-line-number="472"></td>
+        <td id="LC472" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">if</span> (ret != <span class="pl-c1">1</span>)</td>
+      </tr>
+      <tr>
+        <td id="L473" class="blob-num js-line-number" data-line-number="473"></td>
+        <td id="LC473" class="blob-code blob-code-inner js-file-line">		<span class="pl-k">return</span> -EINVAL;</td>
+      </tr>
+      <tr>
+        <td id="L474" class="blob-num js-line-number" data-line-number="474"></td>
+        <td id="LC474" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">if</span> (input &gt; <span class="pl-c1">100</span>) {</td>
+      </tr>
+      <tr>
+        <td id="L475" class="blob-num js-line-number" data-line-number="475"></td>
+        <td id="LC475" class="blob-code blob-code-inner js-file-line">		input = <span class="pl-c1">100</span>;</td>
+      </tr>
+      <tr>
+        <td id="L476" class="blob-num js-line-number" data-line-number="476"></td>
+        <td id="LC476" class="blob-code blob-code-inner js-file-line">	} <span class="pl-k">else</span> <span class="pl-k">if</span> (input &lt; <span class="pl-c1">0</span>) {</td>
+      </tr>
+      <tr>
+        <td id="L477" class="blob-num js-line-number" data-line-number="477"></td>
+        <td id="LC477" class="blob-code blob-code-inner js-file-line">		input = <span class="pl-c1">0</span>;</td>
+      </tr>
+      <tr>
+        <td id="L478" class="blob-num js-line-number" data-line-number="478"></td>
+        <td id="LC478" class="blob-code blob-code-inner js-file-line">	}</td>
+      </tr>
+      <tr>
+        <td id="L479" class="blob-num js-line-number" data-line-number="479"></td>
+        <td id="LC479" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L480" class="blob-num js-line-number" data-line-number="480"></td>
+        <td id="LC480" class="blob-code blob-code-inner js-file-line">        <span class="pl-c">/* buffer reset */</span></td>
+      </tr>
+      <tr>
+        <td id="L481" class="blob-num js-line-number" data-line-number="481"></td>
+        <td id="LC481" class="blob-code blob-code-inner js-file-line">	<span class="pl-c1">for_each_online_cpu</span>(i) {</td>
+      </tr>
+      <tr>
+        <td id="L482" class="blob-num js-line-number" data-line-number="482"></td>
+        <td id="LC482" class="blob-code blob-code-inner js-file-line">		<span class="pl-c1">reset_hist</span>(&amp;hist_load[i]);</td>
+      </tr>
+      <tr>
+        <td id="L483" class="blob-num js-line-number" data-line-number="483"></td>
+        <td id="LC483" class="blob-code blob-code-inner js-file-line">		<span class="pl-c1">reset_hist_high</span>(&amp;hist_load_high[i]);</td>
+      </tr>
+      <tr>
+        <td id="L484" class="blob-num js-line-number" data-line-number="484"></td>
+        <td id="LC484" class="blob-code blob-code-inner js-file-line">	}</td>
+      </tr>
+      <tr>
+        <td id="L485" class="blob-num js-line-number" data-line-number="485"></td>
+        <td id="LC485" class="blob-code blob-code-inner js-file-line">	dbs_tuners_ins.<span class="pl-smi">smart_slow_up_load</span> = input;</td>
+      </tr>
+      <tr>
+        <td id="L486" class="blob-num js-line-number" data-line-number="486"></td>
+        <td id="LC486" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L487" class="blob-num js-line-number" data-line-number="487"></td>
+        <td id="LC487" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">return</span> count;</td>
+      </tr>
+      <tr>
+        <td id="L488" class="blob-num js-line-number" data-line-number="488"></td>
+        <td id="LC488" class="blob-code blob-code-inner js-file-line">}</td>
+      </tr>
+      <tr>
+        <td id="L489" class="blob-num js-line-number" data-line-number="489"></td>
+        <td id="LC489" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L490" class="blob-num js-line-number" data-line-number="490"></td>
+        <td id="LC490" class="blob-code blob-code-inner js-file-line"><span class="pl-k">static</span> <span class="pl-c1">ssize_t</span> <span class="pl-en">store_smart_slow_up_freq</span>(<span class="pl-k">struct</span> kobject *a, <span class="pl-k">struct</span> attribute *b,</td>
+      </tr>
+      <tr>
+        <td id="L491" class="blob-num js-line-number" data-line-number="491"></td>
+        <td id="LC491" class="blob-code blob-code-inner js-file-line">				   <span class="pl-k">const</span> <span class="pl-k">char</span> *buf, <span class="pl-c1">size_t</span> count)</td>
+      </tr>
+      <tr>
+        <td id="L492" class="blob-num js-line-number" data-line-number="492"></td>
+        <td id="LC492" class="blob-code blob-code-inner js-file-line">{</td>
+      </tr>
+      <tr>
+        <td id="L493" class="blob-num js-line-number" data-line-number="493"></td>
+        <td id="LC493" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">unsigned</span> <span class="pl-k">int</span> i, input;</td>
+      </tr>
+      <tr>
+        <td id="L494" class="blob-num js-line-number" data-line-number="494"></td>
+        <td id="LC494" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">int</span> ret;</td>
+      </tr>
+      <tr>
+        <td id="L495" class="blob-num js-line-number" data-line-number="495"></td>
+        <td id="LC495" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L496" class="blob-num js-line-number" data-line-number="496"></td>
+        <td id="LC496" class="blob-code blob-code-inner js-file-line">	ret = <span class="pl-c1">sscanf</span>(buf, <span class="pl-s"><span class="pl-pds">&quot;</span><span class="pl-c1">%u</span><span class="pl-pds">&quot;</span></span>, &amp;input);</td>
+      </tr>
+      <tr>
+        <td id="L497" class="blob-num js-line-number" data-line-number="497"></td>
+        <td id="LC497" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">if</span> (ret != <span class="pl-c1">1</span>)</td>
+      </tr>
+      <tr>
+        <td id="L498" class="blob-num js-line-number" data-line-number="498"></td>
+        <td id="LC498" class="blob-code blob-code-inner js-file-line">		<span class="pl-k">return</span> -EINVAL;</td>
+      </tr>
+      <tr>
+        <td id="L499" class="blob-num js-line-number" data-line-number="499"></td>
+        <td id="LC499" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">if</span> (input &lt; <span class="pl-c1">0</span>)</td>
+      </tr>
+      <tr>
+        <td id="L500" class="blob-num js-line-number" data-line-number="500"></td>
+        <td id="LC500" class="blob-code blob-code-inner js-file-line">		input = <span class="pl-c1">0</span>;</td>
+      </tr>
+      <tr>
+        <td id="L501" class="blob-num js-line-number" data-line-number="501"></td>
+        <td id="LC501" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L502" class="blob-num js-line-number" data-line-number="502"></td>
+        <td id="LC502" class="blob-code blob-code-inner js-file-line">	<span class="pl-c">/* buffer reset */</span></td>
+      </tr>
+      <tr>
+        <td id="L503" class="blob-num js-line-number" data-line-number="503"></td>
+        <td id="LC503" class="blob-code blob-code-inner js-file-line">	<span class="pl-c1">for_each_online_cpu</span>(i) {</td>
+      </tr>
+      <tr>
+        <td id="L504" class="blob-num js-line-number" data-line-number="504"></td>
+        <td id="LC504" class="blob-code blob-code-inner js-file-line">		<span class="pl-c1">reset_hist</span>(&amp;hist_load[i]);</td>
+      </tr>
+      <tr>
+        <td id="L505" class="blob-num js-line-number" data-line-number="505"></td>
+        <td id="LC505" class="blob-code blob-code-inner js-file-line">		<span class="pl-c1">reset_hist_high</span>(&amp;hist_load_high[i]);</td>
+      </tr>
+      <tr>
+        <td id="L506" class="blob-num js-line-number" data-line-number="506"></td>
+        <td id="LC506" class="blob-code blob-code-inner js-file-line">	}</td>
+      </tr>
+      <tr>
+        <td id="L507" class="blob-num js-line-number" data-line-number="507"></td>
+        <td id="LC507" class="blob-code blob-code-inner js-file-line">	dbs_tuners_ins.<span class="pl-smi">smart_slow_up_freq</span> = input;</td>
+      </tr>
+      <tr>
+        <td id="L508" class="blob-num js-line-number" data-line-number="508"></td>
+        <td id="LC508" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L509" class="blob-num js-line-number" data-line-number="509"></td>
+        <td id="LC509" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">return</span> count;</td>
+      </tr>
+      <tr>
+        <td id="L510" class="blob-num js-line-number" data-line-number="510"></td>
+        <td id="LC510" class="blob-code blob-code-inner js-file-line">}</td>
+      </tr>
+      <tr>
+        <td id="L511" class="blob-num js-line-number" data-line-number="511"></td>
+        <td id="LC511" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L512" class="blob-num js-line-number" data-line-number="512"></td>
+        <td id="LC512" class="blob-code blob-code-inner js-file-line"><span class="pl-k">static</span> <span class="pl-c1">ssize_t</span> <span class="pl-en">store_smart_slow_up_dur</span>(<span class="pl-k">struct</span> kobject *a, <span class="pl-k">struct</span> attribute *b,</td>
+      </tr>
+      <tr>
+        <td id="L513" class="blob-num js-line-number" data-line-number="513"></td>
+        <td id="LC513" class="blob-code blob-code-inner js-file-line">				   <span class="pl-k">const</span> <span class="pl-k">char</span> *buf, <span class="pl-c1">size_t</span> count)</td>
+      </tr>
+      <tr>
+        <td id="L514" class="blob-num js-line-number" data-line-number="514"></td>
+        <td id="LC514" class="blob-code blob-code-inner js-file-line">{</td>
+      </tr>
+      <tr>
+        <td id="L515" class="blob-num js-line-number" data-line-number="515"></td>
+        <td id="LC515" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">unsigned</span> <span class="pl-k">int</span> i, input;</td>
+      </tr>
+      <tr>
+        <td id="L516" class="blob-num js-line-number" data-line-number="516"></td>
+        <td id="LC516" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">int</span> ret;</td>
+      </tr>
+      <tr>
+        <td id="L517" class="blob-num js-line-number" data-line-number="517"></td>
+        <td id="LC517" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L518" class="blob-num js-line-number" data-line-number="518"></td>
+        <td id="LC518" class="blob-code blob-code-inner js-file-line">	ret = <span class="pl-c1">sscanf</span>(buf, <span class="pl-s"><span class="pl-pds">&quot;</span><span class="pl-c1">%u</span><span class="pl-pds">&quot;</span></span>, &amp;input);</td>
+      </tr>
+      <tr>
+        <td id="L519" class="blob-num js-line-number" data-line-number="519"></td>
+        <td id="LC519" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">if</span> (ret != <span class="pl-c1">1</span>)</td>
+      </tr>
+      <tr>
+        <td id="L520" class="blob-num js-line-number" data-line-number="520"></td>
+        <td id="LC520" class="blob-code blob-code-inner js-file-line">		<span class="pl-k">return</span> -EINVAL;</td>
+      </tr>
+      <tr>
+        <td id="L521" class="blob-num js-line-number" data-line-number="521"></td>
+        <td id="LC521" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">if</span> (input &gt; SUP_SLOW_UP_DUR) {</td>
+      </tr>
+      <tr>
+        <td id="L522" class="blob-num js-line-number" data-line-number="522"></td>
+        <td id="LC522" class="blob-code blob-code-inner js-file-line">		input = SUP_SLOW_UP_DUR;</td>
+      </tr>
+      <tr>
+        <td id="L523" class="blob-num js-line-number" data-line-number="523"></td>
+        <td id="LC523" class="blob-code blob-code-inner js-file-line">	} <span class="pl-k">else</span> <span class="pl-k">if</span> (input &lt; <span class="pl-c1">1</span>) {</td>
+      </tr>
+      <tr>
+        <td id="L524" class="blob-num js-line-number" data-line-number="524"></td>
+        <td id="LC524" class="blob-code blob-code-inner js-file-line">		input = <span class="pl-c1">1</span>;</td>
+      </tr>
+      <tr>
+        <td id="L525" class="blob-num js-line-number" data-line-number="525"></td>
+        <td id="LC525" class="blob-code blob-code-inner js-file-line">	}</td>
+      </tr>
+      <tr>
+        <td id="L526" class="blob-num js-line-number" data-line-number="526"></td>
+        <td id="LC526" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L527" class="blob-num js-line-number" data-line-number="527"></td>
+        <td id="LC527" class="blob-code blob-code-inner js-file-line">	<span class="pl-c">/* buffer reset */</span></td>
+      </tr>
+      <tr>
+        <td id="L528" class="blob-num js-line-number" data-line-number="528"></td>
+        <td id="LC528" class="blob-code blob-code-inner js-file-line">	<span class="pl-c1">for_each_online_cpu</span>(i) {</td>
+      </tr>
+      <tr>
+        <td id="L529" class="blob-num js-line-number" data-line-number="529"></td>
+        <td id="LC529" class="blob-code blob-code-inner js-file-line">		<span class="pl-c1">reset_hist</span>(&amp;hist_load[i]);</td>
+      </tr>
+      <tr>
+        <td id="L530" class="blob-num js-line-number" data-line-number="530"></td>
+        <td id="LC530" class="blob-code blob-code-inner js-file-line">		<span class="pl-c1">reset_hist_high</span>(&amp;hist_load_high[i]);</td>
+      </tr>
+      <tr>
+        <td id="L531" class="blob-num js-line-number" data-line-number="531"></td>
+        <td id="LC531" class="blob-code blob-code-inner js-file-line">	}</td>
+      </tr>
+      <tr>
+        <td id="L532" class="blob-num js-line-number" data-line-number="532"></td>
+        <td id="LC532" class="blob-code blob-code-inner js-file-line">	dbs_tuners_ins.<span class="pl-smi">smart_slow_up_dur</span> = input;</td>
+      </tr>
+      <tr>
+        <td id="L533" class="blob-num js-line-number" data-line-number="533"></td>
+        <td id="LC533" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L534" class="blob-num js-line-number" data-line-number="534"></td>
+        <td id="LC534" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">return</span> count;</td>
+      </tr>
+      <tr>
+        <td id="L535" class="blob-num js-line-number" data-line-number="535"></td>
+        <td id="LC535" class="blob-code blob-code-inner js-file-line">}</td>
+      </tr>
+      <tr>
+        <td id="L536" class="blob-num js-line-number" data-line-number="536"></td>
+        <td id="LC536" class="blob-code blob-code-inner js-file-line"><span class="pl-k">static</span> <span class="pl-c1">ssize_t</span> <span class="pl-en">store_smart_high_slow_up_freq</span>(<span class="pl-k">struct</span> kobject *a, <span class="pl-k">struct</span> attribute *b,</td>
+      </tr>
+      <tr>
+        <td id="L537" class="blob-num js-line-number" data-line-number="537"></td>
+        <td id="LC537" class="blob-code blob-code-inner js-file-line">				   <span class="pl-k">const</span> <span class="pl-k">char</span> *buf, <span class="pl-c1">size_t</span> count)</td>
+      </tr>
+      <tr>
+        <td id="L538" class="blob-num js-line-number" data-line-number="538"></td>
+        <td id="LC538" class="blob-code blob-code-inner js-file-line">{</td>
+      </tr>
+      <tr>
+        <td id="L539" class="blob-num js-line-number" data-line-number="539"></td>
+        <td id="LC539" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">unsigned</span> <span class="pl-k">int</span> input;</td>
+      </tr>
+      <tr>
+        <td id="L540" class="blob-num js-line-number" data-line-number="540"></td>
+        <td id="LC540" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">int</span> ret;</td>
+      </tr>
+      <tr>
+        <td id="L541" class="blob-num js-line-number" data-line-number="541"></td>
+        <td id="LC541" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">unsigned</span> <span class="pl-k">int</span> i;</td>
+      </tr>
+      <tr>
+        <td id="L542" class="blob-num js-line-number" data-line-number="542"></td>
+        <td id="LC542" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L543" class="blob-num js-line-number" data-line-number="543"></td>
+        <td id="LC543" class="blob-code blob-code-inner js-file-line">	ret = <span class="pl-c1">sscanf</span>(buf, <span class="pl-s"><span class="pl-pds">&quot;</span><span class="pl-c1">%u</span><span class="pl-pds">&quot;</span></span>, &amp;input);</td>
+      </tr>
+      <tr>
+        <td id="L544" class="blob-num js-line-number" data-line-number="544"></td>
+        <td id="LC544" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">if</span> (ret != <span class="pl-c1">1</span>)</td>
+      </tr>
+      <tr>
+        <td id="L545" class="blob-num js-line-number" data-line-number="545"></td>
+        <td id="LC545" class="blob-code blob-code-inner js-file-line">		<span class="pl-k">return</span> -EINVAL;</td>
+      </tr>
+      <tr>
+        <td id="L546" class="blob-num js-line-number" data-line-number="546"></td>
+        <td id="LC546" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">if</span> (input &lt; <span class="pl-c1">0</span>)</td>
+      </tr>
+      <tr>
+        <td id="L547" class="blob-num js-line-number" data-line-number="547"></td>
+        <td id="LC547" class="blob-code blob-code-inner js-file-line">		input = <span class="pl-c1">0</span>;</td>
+      </tr>
+      <tr>
+        <td id="L548" class="blob-num js-line-number" data-line-number="548"></td>
+        <td id="LC548" class="blob-code blob-code-inner js-file-line">	<span class="pl-c">/* buffer reset */</span></td>
+      </tr>
+      <tr>
+        <td id="L549" class="blob-num js-line-number" data-line-number="549"></td>
+        <td id="LC549" class="blob-code blob-code-inner js-file-line">	<span class="pl-c1">for_each_online_cpu</span>(i) {</td>
+      </tr>
+      <tr>
+        <td id="L550" class="blob-num js-line-number" data-line-number="550"></td>
+        <td id="LC550" class="blob-code blob-code-inner js-file-line">		<span class="pl-c1">reset_hist</span>(&amp;hist_load[i]);</td>
+      </tr>
+      <tr>
+        <td id="L551" class="blob-num js-line-number" data-line-number="551"></td>
+        <td id="LC551" class="blob-code blob-code-inner js-file-line">		<span class="pl-c1">reset_hist_high</span>(&amp;hist_load_high[i]);</td>
+      </tr>
+      <tr>
+        <td id="L552" class="blob-num js-line-number" data-line-number="552"></td>
+        <td id="LC552" class="blob-code blob-code-inner js-file-line">	}</td>
+      </tr>
+      <tr>
+        <td id="L553" class="blob-num js-line-number" data-line-number="553"></td>
+        <td id="LC553" class="blob-code blob-code-inner js-file-line">	dbs_tuners_ins.<span class="pl-smi">smart_high_slow_up_freq</span> = input;</td>
+      </tr>
+      <tr>
+        <td id="L554" class="blob-num js-line-number" data-line-number="554"></td>
+        <td id="LC554" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L555" class="blob-num js-line-number" data-line-number="555"></td>
+        <td id="LC555" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">return</span> count;</td>
+      </tr>
+      <tr>
+        <td id="L556" class="blob-num js-line-number" data-line-number="556"></td>
+        <td id="LC556" class="blob-code blob-code-inner js-file-line">}</td>
+      </tr>
+      <tr>
+        <td id="L557" class="blob-num js-line-number" data-line-number="557"></td>
+        <td id="LC557" class="blob-code blob-code-inner js-file-line"><span class="pl-k">static</span> <span class="pl-c1">ssize_t</span> <span class="pl-en">store_smart_high_slow_up_dur</span>(<span class="pl-k">struct</span> kobject *a, <span class="pl-k">struct</span> attribute *b,</td>
+      </tr>
+      <tr>
+        <td id="L558" class="blob-num js-line-number" data-line-number="558"></td>
+        <td id="LC558" class="blob-code blob-code-inner js-file-line">				   <span class="pl-k">const</span> <span class="pl-k">char</span> *buf, <span class="pl-c1">size_t</span> count)</td>
+      </tr>
+      <tr>
+        <td id="L559" class="blob-num js-line-number" data-line-number="559"></td>
+        <td id="LC559" class="blob-code blob-code-inner js-file-line">{</td>
+      </tr>
+      <tr>
+        <td id="L560" class="blob-num js-line-number" data-line-number="560"></td>
+        <td id="LC560" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">unsigned</span> <span class="pl-k">int</span> input;</td>
+      </tr>
+      <tr>
+        <td id="L561" class="blob-num js-line-number" data-line-number="561"></td>
+        <td id="LC561" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">int</span> ret;</td>
+      </tr>
+      <tr>
+        <td id="L562" class="blob-num js-line-number" data-line-number="562"></td>
+        <td id="LC562" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">unsigned</span> <span class="pl-k">int</span> i;</td>
+      </tr>
+      <tr>
+        <td id="L563" class="blob-num js-line-number" data-line-number="563"></td>
+        <td id="LC563" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L564" class="blob-num js-line-number" data-line-number="564"></td>
+        <td id="LC564" class="blob-code blob-code-inner js-file-line">	ret = <span class="pl-c1">sscanf</span>(buf, <span class="pl-s"><span class="pl-pds">&quot;</span><span class="pl-c1">%u</span><span class="pl-pds">&quot;</span></span>, &amp;input);</td>
+      </tr>
+      <tr>
+        <td id="L565" class="blob-num js-line-number" data-line-number="565"></td>
+        <td id="LC565" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">if</span> (ret != <span class="pl-c1">1</span>)</td>
+      </tr>
+      <tr>
+        <td id="L566" class="blob-num js-line-number" data-line-number="566"></td>
+        <td id="LC566" class="blob-code blob-code-inner js-file-line">		<span class="pl-k">return</span> -EINVAL;</td>
+      </tr>
+      <tr>
+        <td id="L567" class="blob-num js-line-number" data-line-number="567"></td>
+        <td id="LC567" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">if</span> (input &gt; SUP_HIGH_SLOW_UP_DUR ) {</td>
+      </tr>
+      <tr>
+        <td id="L568" class="blob-num js-line-number" data-line-number="568"></td>
+        <td id="LC568" class="blob-code blob-code-inner js-file-line">		input = SUP_HIGH_SLOW_UP_DUR;</td>
+      </tr>
+      <tr>
+        <td id="L569" class="blob-num js-line-number" data-line-number="569"></td>
+        <td id="LC569" class="blob-code blob-code-inner js-file-line">	}<span class="pl-k">else</span> <span class="pl-k">if</span> (input &lt; <span class="pl-c1">1</span> ) {</td>
+      </tr>
+      <tr>
+        <td id="L570" class="blob-num js-line-number" data-line-number="570"></td>
+        <td id="LC570" class="blob-code blob-code-inner js-file-line">		input = <span class="pl-c1">1</span>;</td>
+      </tr>
+      <tr>
+        <td id="L571" class="blob-num js-line-number" data-line-number="571"></td>
+        <td id="LC571" class="blob-code blob-code-inner js-file-line">	}</td>
+      </tr>
+      <tr>
+        <td id="L572" class="blob-num js-line-number" data-line-number="572"></td>
+        <td id="LC572" class="blob-code blob-code-inner js-file-line">	<span class="pl-c">/* buffer reset */</span></td>
+      </tr>
+      <tr>
+        <td id="L573" class="blob-num js-line-number" data-line-number="573"></td>
+        <td id="LC573" class="blob-code blob-code-inner js-file-line">	<span class="pl-c1">for_each_online_cpu</span>(i) {</td>
+      </tr>
+      <tr>
+        <td id="L574" class="blob-num js-line-number" data-line-number="574"></td>
+        <td id="LC574" class="blob-code blob-code-inner js-file-line">		<span class="pl-c1">reset_hist</span>(&amp;hist_load[i]);</td>
+      </tr>
+      <tr>
+        <td id="L575" class="blob-num js-line-number" data-line-number="575"></td>
+        <td id="LC575" class="blob-code blob-code-inner js-file-line">		<span class="pl-c1">reset_hist_high</span>(&amp;hist_load_high[i]);</td>
+      </tr>
+      <tr>
+        <td id="L576" class="blob-num js-line-number" data-line-number="576"></td>
+        <td id="LC576" class="blob-code blob-code-inner js-file-line">	}</td>
+      </tr>
+      <tr>
+        <td id="L577" class="blob-num js-line-number" data-line-number="577"></td>
+        <td id="LC577" class="blob-code blob-code-inner js-file-line">	dbs_tuners_ins.<span class="pl-smi">smart_high_slow_up_dur</span> = input;</td>
+      </tr>
+      <tr>
+        <td id="L578" class="blob-num js-line-number" data-line-number="578"></td>
+        <td id="LC578" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L579" class="blob-num js-line-number" data-line-number="579"></td>
+        <td id="LC579" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">return</span> count;</td>
+      </tr>
+      <tr>
+        <td id="L580" class="blob-num js-line-number" data-line-number="580"></td>
+        <td id="LC580" class="blob-code blob-code-inner js-file-line">}</td>
+      </tr>
+      <tr>
+        <td id="L581" class="blob-num js-line-number" data-line-number="581"></td>
+        <td id="LC581" class="blob-code blob-code-inner js-file-line"><span class="pl-k">static</span> <span class="pl-c1">ssize_t</span> <span class="pl-en">store_smart_each_off</span>(<span class="pl-k">struct</span> kobject *a, <span class="pl-k">struct</span> attribute *b,</td>
+      </tr>
+      <tr>
+        <td id="L582" class="blob-num js-line-number" data-line-number="582"></td>
+        <td id="LC582" class="blob-code blob-code-inner js-file-line">				   <span class="pl-k">const</span> <span class="pl-k">char</span> *buf, <span class="pl-c1">size_t</span> count)</td>
+      </tr>
+      <tr>
+        <td id="L583" class="blob-num js-line-number" data-line-number="583"></td>
+        <td id="LC583" class="blob-code blob-code-inner js-file-line">{</td>
+      </tr>
+      <tr>
+        <td id="L584" class="blob-num js-line-number" data-line-number="584"></td>
+        <td id="LC584" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">unsigned</span> <span class="pl-k">int</span> i, input;</td>
+      </tr>
+      <tr>
+        <td id="L585" class="blob-num js-line-number" data-line-number="585"></td>
+        <td id="LC585" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">int</span> ret;</td>
+      </tr>
+      <tr>
+        <td id="L586" class="blob-num js-line-number" data-line-number="586"></td>
+        <td id="LC586" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L587" class="blob-num js-line-number" data-line-number="587"></td>
+        <td id="LC587" class="blob-code blob-code-inner js-file-line">	ret = <span class="pl-c1">sscanf</span>(buf, <span class="pl-s"><span class="pl-pds">&quot;</span><span class="pl-c1">%u</span><span class="pl-pds">&quot;</span></span>, &amp;input);</td>
+      </tr>
+      <tr>
+        <td id="L588" class="blob-num js-line-number" data-line-number="588"></td>
+        <td id="LC588" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">if</span> (ret != <span class="pl-c1">1</span>)</td>
+      </tr>
+      <tr>
+        <td id="L589" class="blob-num js-line-number" data-line-number="589"></td>
+        <td id="LC589" class="blob-code blob-code-inner js-file-line">		<span class="pl-k">return</span> -EINVAL;</td>
+      </tr>
+      <tr>
+        <td id="L590" class="blob-num js-line-number" data-line-number="590"></td>
+        <td id="LC590" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">if</span> (input &gt; SUP_CORE_NUM) {</td>
+      </tr>
+      <tr>
+        <td id="L591" class="blob-num js-line-number" data-line-number="591"></td>
+        <td id="LC591" class="blob-code blob-code-inner js-file-line">		input = SUP_CORE_NUM;</td>
+      </tr>
+      <tr>
+        <td id="L592" class="blob-num js-line-number" data-line-number="592"></td>
+        <td id="LC592" class="blob-code blob-code-inner js-file-line">	} <span class="pl-k">else</span> <span class="pl-k">if</span> (input &lt; <span class="pl-c1">0</span>) {</td>
+      </tr>
+      <tr>
+        <td id="L593" class="blob-num js-line-number" data-line-number="593"></td>
+        <td id="LC593" class="blob-code blob-code-inner js-file-line">		input = <span class="pl-c1">0</span>;</td>
+      </tr>
+      <tr>
+        <td id="L594" class="blob-num js-line-number" data-line-number="594"></td>
+        <td id="LC594" class="blob-code blob-code-inner js-file-line">	}</td>
+      </tr>
+      <tr>
+        <td id="L595" class="blob-num js-line-number" data-line-number="595"></td>
+        <td id="LC595" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L596" class="blob-num js-line-number" data-line-number="596"></td>
+        <td id="LC596" class="blob-code blob-code-inner js-file-line">	<span class="pl-c">/* buffer reset */</span></td>
+      </tr>
+      <tr>
+        <td id="L597" class="blob-num js-line-number" data-line-number="597"></td>
+        <td id="LC597" class="blob-code blob-code-inner js-file-line">	<span class="pl-c1">for_each_online_cpu</span>(i) {</td>
+      </tr>
+      <tr>
+        <td id="L598" class="blob-num js-line-number" data-line-number="598"></td>
+        <td id="LC598" class="blob-code blob-code-inner js-file-line">		<span class="pl-c1">reset_hist</span>(&amp;hist_load[i]);</td>
+      </tr>
+      <tr>
+        <td id="L599" class="blob-num js-line-number" data-line-number="599"></td>
+        <td id="LC599" class="blob-code blob-code-inner js-file-line">		<span class="pl-c1">reset_hist_high</span>(&amp;hist_load_high[i]);</td>
+      </tr>
+      <tr>
+        <td id="L600" class="blob-num js-line-number" data-line-number="600"></td>
+        <td id="LC600" class="blob-code blob-code-inner js-file-line">	}</td>
+      </tr>
+      <tr>
+        <td id="L601" class="blob-num js-line-number" data-line-number="601"></td>
+        <td id="LC601" class="blob-code blob-code-inner js-file-line">	dbs_tuners_ins.<span class="pl-smi">smart_each_off</span> = input;</td>
+      </tr>
+      <tr>
+        <td id="L602" class="blob-num js-line-number" data-line-number="602"></td>
+        <td id="LC602" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L603" class="blob-num js-line-number" data-line-number="603"></td>
+        <td id="LC603" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">return</span> count;</td>
+      </tr>
+      <tr>
+        <td id="L604" class="blob-num js-line-number" data-line-number="604"></td>
+        <td id="LC604" class="blob-code blob-code-inner js-file-line">}</td>
+      </tr>
+      <tr>
+        <td id="L605" class="blob-num js-line-number" data-line-number="605"></td>
+        <td id="LC605" class="blob-code blob-code-inner js-file-line"><span class="pl-c">/* end smart_up */</span></td>
+      </tr>
+      <tr>
+        <td id="L606" class="blob-num js-line-number" data-line-number="606"></td>
+        <td id="LC606" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L607" class="blob-num js-line-number" data-line-number="607"></td>
+        <td id="LC607" class="blob-code blob-code-inner js-file-line"><span class="pl-k">static</span> <span class="pl-c1">ssize_t</span> <span class="pl-en">store_freq_step</span>(<span class="pl-k">struct</span> kobject *a,</td>
+      </tr>
+      <tr>
+        <td id="L608" class="blob-num js-line-number" data-line-number="608"></td>
+        <td id="LC608" class="blob-code blob-code-inner js-file-line">			<span class="pl-k">struct</span> attribute *b, <span class="pl-k">const</span> <span class="pl-k">char</span> *buf, <span class="pl-c1">size_t</span> count)</td>
+      </tr>
+      <tr>
+        <td id="L609" class="blob-num js-line-number" data-line-number="609"></td>
+        <td id="LC609" class="blob-code blob-code-inner js-file-line">{</td>
+      </tr>
+      <tr>
+        <td id="L610" class="blob-num js-line-number" data-line-number="610"></td>
+        <td id="LC610" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">unsigned</span> <span class="pl-k">int</span> input;</td>
+      </tr>
+      <tr>
+        <td id="L611" class="blob-num js-line-number" data-line-number="611"></td>
+        <td id="LC611" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">int</span> ret;</td>
+      </tr>
+      <tr>
+        <td id="L612" class="blob-num js-line-number" data-line-number="612"></td>
+        <td id="LC612" class="blob-code blob-code-inner js-file-line">	ret = <span class="pl-c1">sscanf</span>(buf, <span class="pl-s"><span class="pl-pds">&quot;</span><span class="pl-c1">%u</span><span class="pl-pds">&quot;</span></span>, &amp;input);</td>
+      </tr>
+      <tr>
+        <td id="L613" class="blob-num js-line-number" data-line-number="613"></td>
+        <td id="LC613" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L614" class="blob-num js-line-number" data-line-number="614"></td>
+        <td id="LC614" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">if</span> (ret != <span class="pl-c1">1</span> || input &gt; <span class="pl-c1">100</span> ||</td>
+      </tr>
+      <tr>
+        <td id="L615" class="blob-num js-line-number" data-line-number="615"></td>
+        <td id="LC615" class="blob-code blob-code-inner js-file-line">			input &lt; <span class="pl-c1">0</span>) {</td>
+      </tr>
+      <tr>
+        <td id="L616" class="blob-num js-line-number" data-line-number="616"></td>
+        <td id="LC616" class="blob-code blob-code-inner js-file-line">		<span class="pl-k">return</span> -EINVAL;</td>
+      </tr>
+      <tr>
+        <td id="L617" class="blob-num js-line-number" data-line-number="617"></td>
+        <td id="LC617" class="blob-code blob-code-inner js-file-line">	}</td>
+      </tr>
+      <tr>
+        <td id="L618" class="blob-num js-line-number" data-line-number="618"></td>
+        <td id="LC618" class="blob-code blob-code-inner js-file-line">	dbs_tuners_ins.<span class="pl-smi">freq_step</span> = input;</td>
+      </tr>
+      <tr>
+        <td id="L619" class="blob-num js-line-number" data-line-number="619"></td>
+        <td id="LC619" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L620" class="blob-num js-line-number" data-line-number="620"></td>
+        <td id="LC620" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">return</span> count;</td>
+      </tr>
+      <tr>
+        <td id="L621" class="blob-num js-line-number" data-line-number="621"></td>
+        <td id="LC621" class="blob-code blob-code-inner js-file-line">}</td>
+      </tr>
+      <tr>
+        <td id="L622" class="blob-num js-line-number" data-line-number="622"></td>
+        <td id="LC622" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L623" class="blob-num js-line-number" data-line-number="623"></td>
+        <td id="LC623" class="blob-code blob-code-inner js-file-line"><span class="pl-k">static</span> <span class="pl-c1">ssize_t</span> <span class="pl-en">store_step_up_early_hispeed</span>(<span class="pl-k">struct</span> kobject *a,</td>
+      </tr>
+      <tr>
+        <td id="L624" class="blob-num js-line-number" data-line-number="624"></td>
+        <td id="LC624" class="blob-code blob-code-inner js-file-line">			<span class="pl-k">struct</span> attribute *b, <span class="pl-k">const</span> <span class="pl-k">char</span> *buf, <span class="pl-c1">size_t</span> count)</td>
+      </tr>
+      <tr>
+        <td id="L625" class="blob-num js-line-number" data-line-number="625"></td>
+        <td id="LC625" class="blob-code blob-code-inner js-file-line">{</td>
+      </tr>
+      <tr>
+        <td id="L626" class="blob-num js-line-number" data-line-number="626"></td>
+        <td id="LC626" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">unsigned</span> <span class="pl-k">int</span> input;</td>
+      </tr>
+      <tr>
+        <td id="L627" class="blob-num js-line-number" data-line-number="627"></td>
+        <td id="LC627" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">int</span> ret;</td>
+      </tr>
+      <tr>
+        <td id="L628" class="blob-num js-line-number" data-line-number="628"></td>
+        <td id="LC628" class="blob-code blob-code-inner js-file-line">	ret = <span class="pl-c1">sscanf</span>(buf, <span class="pl-s"><span class="pl-pds">&quot;</span><span class="pl-c1">%u</span><span class="pl-pds">&quot;</span></span>, &amp;input);</td>
+      </tr>
+      <tr>
+        <td id="L629" class="blob-num js-line-number" data-line-number="629"></td>
+        <td id="LC629" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L630" class="blob-num js-line-number" data-line-number="630"></td>
+        <td id="LC630" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">if</span> (ret != <span class="pl-c1">1</span> || input &gt; <span class="pl-c1">2265600</span> ||</td>
+      </tr>
+      <tr>
+        <td id="L631" class="blob-num js-line-number" data-line-number="631"></td>
+        <td id="LC631" class="blob-code blob-code-inner js-file-line">			input &lt; <span class="pl-c1">0</span>) {</td>
+      </tr>
+      <tr>
+        <td id="L632" class="blob-num js-line-number" data-line-number="632"></td>
+        <td id="LC632" class="blob-code blob-code-inner js-file-line">		<span class="pl-k">return</span> -EINVAL;</td>
+      </tr>
+      <tr>
+        <td id="L633" class="blob-num js-line-number" data-line-number="633"></td>
+        <td id="LC633" class="blob-code blob-code-inner js-file-line">	}</td>
+      </tr>
+      <tr>
+        <td id="L634" class="blob-num js-line-number" data-line-number="634"></td>
+        <td id="LC634" class="blob-code blob-code-inner js-file-line">	dbs_tuners_ins.<span class="pl-smi">step_up_early_hispeed</span> = input;</td>
+      </tr>
+      <tr>
+        <td id="L635" class="blob-num js-line-number" data-line-number="635"></td>
+        <td id="LC635" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L636" class="blob-num js-line-number" data-line-number="636"></td>
+        <td id="LC636" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">return</span> count;</td>
+      </tr>
+      <tr>
+        <td id="L637" class="blob-num js-line-number" data-line-number="637"></td>
+        <td id="LC637" class="blob-code blob-code-inner js-file-line">}</td>
+      </tr>
+      <tr>
+        <td id="L638" class="blob-num js-line-number" data-line-number="638"></td>
+        <td id="LC638" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L639" class="blob-num js-line-number" data-line-number="639"></td>
+        <td id="LC639" class="blob-code blob-code-inner js-file-line"><span class="pl-k">static</span> <span class="pl-c1">ssize_t</span> <span class="pl-en">store_step_up_interim_hispeed</span>(<span class="pl-k">struct</span> kobject *a,</td>
+      </tr>
+      <tr>
+        <td id="L640" class="blob-num js-line-number" data-line-number="640"></td>
+        <td id="LC640" class="blob-code blob-code-inner js-file-line">			<span class="pl-k">struct</span> attribute *b, <span class="pl-k">const</span> <span class="pl-k">char</span> *buf, <span class="pl-c1">size_t</span> count)</td>
+      </tr>
+      <tr>
+        <td id="L641" class="blob-num js-line-number" data-line-number="641"></td>
+        <td id="LC641" class="blob-code blob-code-inner js-file-line">{</td>
+      </tr>
+      <tr>
+        <td id="L642" class="blob-num js-line-number" data-line-number="642"></td>
+        <td id="LC642" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">unsigned</span> <span class="pl-k">int</span> input;</td>
+      </tr>
+      <tr>
+        <td id="L643" class="blob-num js-line-number" data-line-number="643"></td>
+        <td id="LC643" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">int</span> ret;</td>
+      </tr>
+      <tr>
+        <td id="L644" class="blob-num js-line-number" data-line-number="644"></td>
+        <td id="LC644" class="blob-code blob-code-inner js-file-line">	ret = <span class="pl-c1">sscanf</span>(buf, <span class="pl-s"><span class="pl-pds">&quot;</span><span class="pl-c1">%u</span><span class="pl-pds">&quot;</span></span>, &amp;input);</td>
+      </tr>
+      <tr>
+        <td id="L645" class="blob-num js-line-number" data-line-number="645"></td>
+        <td id="LC645" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L646" class="blob-num js-line-number" data-line-number="646"></td>
+        <td id="LC646" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">if</span> (ret != <span class="pl-c1">1</span> || input &gt; DEF_STEP_UP_INTERIM_HISPEED ||</td>
+      </tr>
+      <tr>
+        <td id="L647" class="blob-num js-line-number" data-line-number="647"></td>
+        <td id="LC647" class="blob-code blob-code-inner js-file-line">			input &lt; <span class="pl-c1">0</span>) {</td>
+      </tr>
+      <tr>
+        <td id="L648" class="blob-num js-line-number" data-line-number="648"></td>
+        <td id="LC648" class="blob-code blob-code-inner js-file-line">		<span class="pl-k">return</span> -EINVAL;</td>
+      </tr>
+      <tr>
+        <td id="L649" class="blob-num js-line-number" data-line-number="649"></td>
+        <td id="LC649" class="blob-code blob-code-inner js-file-line">	}</td>
+      </tr>
+      <tr>
+        <td id="L650" class="blob-num js-line-number" data-line-number="650"></td>
+        <td id="LC650" class="blob-code blob-code-inner js-file-line">	dbs_tuners_ins.<span class="pl-smi">step_up_interim_hispeed</span> = input;</td>
+      </tr>
+      <tr>
+        <td id="L651" class="blob-num js-line-number" data-line-number="651"></td>
+        <td id="LC651" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L652" class="blob-num js-line-number" data-line-number="652"></td>
+        <td id="LC652" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">return</span> count;</td>
+      </tr>
+      <tr>
+        <td id="L653" class="blob-num js-line-number" data-line-number="653"></td>
+        <td id="LC653" class="blob-code blob-code-inner js-file-line">}</td>
+      </tr>
+      <tr>
+        <td id="L654" class="blob-num js-line-number" data-line-number="654"></td>
+        <td id="LC654" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L655" class="blob-num js-line-number" data-line-number="655"></td>
+        <td id="LC655" class="blob-code blob-code-inner js-file-line"><span class="pl-k">static</span> <span class="pl-c1">ssize_t</span> <span class="pl-en">store_sampling_early_factor</span>(<span class="pl-k">struct</span> kobject *a,</td>
+      </tr>
+      <tr>
+        <td id="L656" class="blob-num js-line-number" data-line-number="656"></td>
+        <td id="LC656" class="blob-code blob-code-inner js-file-line">			<span class="pl-k">struct</span> attribute *b, <span class="pl-k">const</span> <span class="pl-k">char</span> *buf, <span class="pl-c1">size_t</span> count)</td>
+      </tr>
+      <tr>
+        <td id="L657" class="blob-num js-line-number" data-line-number="657"></td>
+        <td id="LC657" class="blob-code blob-code-inner js-file-line">{</td>
+      </tr>
+      <tr>
+        <td id="L658" class="blob-num js-line-number" data-line-number="658"></td>
+        <td id="LC658" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">unsigned</span> <span class="pl-k">int</span> input;</td>
+      </tr>
+      <tr>
+        <td id="L659" class="blob-num js-line-number" data-line-number="659"></td>
+        <td id="LC659" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">int</span> ret;</td>
+      </tr>
+      <tr>
+        <td id="L660" class="blob-num js-line-number" data-line-number="660"></td>
+        <td id="LC660" class="blob-code blob-code-inner js-file-line">	ret = <span class="pl-c1">sscanf</span>(buf, <span class="pl-s"><span class="pl-pds">&quot;</span><span class="pl-c1">%u</span><span class="pl-pds">&quot;</span></span>, &amp;input);</td>
+      </tr>
+      <tr>
+        <td id="L661" class="blob-num js-line-number" data-line-number="661"></td>
+        <td id="LC661" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L662" class="blob-num js-line-number" data-line-number="662"></td>
+        <td id="LC662" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">if</span> (ret != <span class="pl-c1">1</span> || input &lt; <span class="pl-c1">1</span>)</td>
+      </tr>
+      <tr>
+        <td id="L663" class="blob-num js-line-number" data-line-number="663"></td>
+        <td id="LC663" class="blob-code blob-code-inner js-file-line">		<span class="pl-k">return</span> -EINVAL;</td>
+      </tr>
+      <tr>
+        <td id="L664" class="blob-num js-line-number" data-line-number="664"></td>
+        <td id="LC664" class="blob-code blob-code-inner js-file-line">	dbs_tuners_ins.<span class="pl-smi">sampling_early_factor</span> = input;</td>
+      </tr>
+      <tr>
+        <td id="L665" class="blob-num js-line-number" data-line-number="665"></td>
+        <td id="LC665" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L666" class="blob-num js-line-number" data-line-number="666"></td>
+        <td id="LC666" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">return</span> count;</td>
+      </tr>
+      <tr>
+        <td id="L667" class="blob-num js-line-number" data-line-number="667"></td>
+        <td id="LC667" class="blob-code blob-code-inner js-file-line">}</td>
+      </tr>
+      <tr>
+        <td id="L668" class="blob-num js-line-number" data-line-number="668"></td>
+        <td id="LC668" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L669" class="blob-num js-line-number" data-line-number="669"></td>
+        <td id="LC669" class="blob-code blob-code-inner js-file-line"><span class="pl-k">static</span> <span class="pl-c1">ssize_t</span> <span class="pl-en">store_sampling_interim_factor</span>(<span class="pl-k">struct</span> kobject *a,</td>
+      </tr>
+      <tr>
+        <td id="L670" class="blob-num js-line-number" data-line-number="670"></td>
+        <td id="LC670" class="blob-code blob-code-inner js-file-line">			<span class="pl-k">struct</span> attribute *b, <span class="pl-k">const</span> <span class="pl-k">char</span> *buf, <span class="pl-c1">size_t</span> count)</td>
+      </tr>
+      <tr>
+        <td id="L671" class="blob-num js-line-number" data-line-number="671"></td>
+        <td id="LC671" class="blob-code blob-code-inner js-file-line">{</td>
+      </tr>
+      <tr>
+        <td id="L672" class="blob-num js-line-number" data-line-number="672"></td>
+        <td id="LC672" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">unsigned</span> <span class="pl-k">int</span> input;</td>
+      </tr>
+      <tr>
+        <td id="L673" class="blob-num js-line-number" data-line-number="673"></td>
+        <td id="LC673" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">int</span> ret;</td>
+      </tr>
+      <tr>
+        <td id="L674" class="blob-num js-line-number" data-line-number="674"></td>
+        <td id="LC674" class="blob-code blob-code-inner js-file-line">	ret = <span class="pl-c1">sscanf</span>(buf, <span class="pl-s"><span class="pl-pds">&quot;</span><span class="pl-c1">%u</span><span class="pl-pds">&quot;</span></span>, &amp;input);</td>
+      </tr>
+      <tr>
+        <td id="L675" class="blob-num js-line-number" data-line-number="675"></td>
+        <td id="LC675" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L676" class="blob-num js-line-number" data-line-number="676"></td>
+        <td id="LC676" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">if</span> (ret != <span class="pl-c1">1</span> || input &lt; <span class="pl-c1">1</span>)</td>
+      </tr>
+      <tr>
+        <td id="L677" class="blob-num js-line-number" data-line-number="677"></td>
+        <td id="LC677" class="blob-code blob-code-inner js-file-line">		<span class="pl-k">return</span> -EINVAL;</td>
+      </tr>
+      <tr>
+        <td id="L678" class="blob-num js-line-number" data-line-number="678"></td>
+        <td id="LC678" class="blob-code blob-code-inner js-file-line">	dbs_tuners_ins.<span class="pl-smi">sampling_interim_factor</span> = input;</td>
+      </tr>
+      <tr>
+        <td id="L679" class="blob-num js-line-number" data-line-number="679"></td>
+        <td id="LC679" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L680" class="blob-num js-line-number" data-line-number="680"></td>
+        <td id="LC680" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">return</span> count;</td>
+      </tr>
+      <tr>
+        <td id="L681" class="blob-num js-line-number" data-line-number="681"></td>
+        <td id="LC681" class="blob-code blob-code-inner js-file-line">}</td>
+      </tr>
+      <tr>
+        <td id="L682" class="blob-num js-line-number" data-line-number="682"></td>
+        <td id="LC682" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L683" class="blob-num js-line-number" data-line-number="683"></td>
+        <td id="LC683" class="blob-code blob-code-inner js-file-line"><span class="pl-en">define_one_global_rw</span>(sampling_rate);</td>
+      </tr>
+      <tr>
+        <td id="L684" class="blob-num js-line-number" data-line-number="684"></td>
+        <td id="LC684" class="blob-code blob-code-inner js-file-line"><span class="pl-en">define_one_global_rw</span>(up_threshold);</td>
+      </tr>
+      <tr>
+        <td id="L685" class="blob-num js-line-number" data-line-number="685"></td>
+        <td id="LC685" class="blob-code blob-code-inner js-file-line"><span class="pl-en">define_one_global_rw</span>(sampling_down_factor);</td>
+      </tr>
+      <tr>
+        <td id="L686" class="blob-num js-line-number" data-line-number="686"></td>
+        <td id="LC686" class="blob-code blob-code-inner js-file-line"><span class="pl-en">define_one_global_rw</span>(up_threshold_multi_core);</td>
+      </tr>
+      <tr>
+        <td id="L687" class="blob-num js-line-number" data-line-number="687"></td>
+        <td id="LC687" class="blob-code blob-code-inner js-file-line"><span class="pl-en">define_one_global_rw</span>(optimal_freq);</td>
+      </tr>
+      <tr>
+        <td id="L688" class="blob-num js-line-number" data-line-number="688"></td>
+        <td id="LC688" class="blob-code blob-code-inner js-file-line"><span class="pl-en">define_one_global_rw</span>(up_threshold_any_cpu_load);</td>
+      </tr>
+      <tr>
+        <td id="L689" class="blob-num js-line-number" data-line-number="689"></td>
+        <td id="LC689" class="blob-code blob-code-inner js-file-line"><span class="pl-en">define_one_global_rw</span>(sync_freq);</td>
+      </tr>
+      <tr>
+        <td id="L690" class="blob-num js-line-number" data-line-number="690"></td>
+        <td id="LC690" class="blob-code blob-code-inner js-file-line"><span class="pl-c">/* 20130711 smart_up */</span></td>
+      </tr>
+      <tr>
+        <td id="L691" class="blob-num js-line-number" data-line-number="691"></td>
+        <td id="LC691" class="blob-code blob-code-inner js-file-line"><span class="pl-en">define_one_global_rw</span>(smart_up);</td>
+      </tr>
+      <tr>
+        <td id="L692" class="blob-num js-line-number" data-line-number="692"></td>
+        <td id="LC692" class="blob-code blob-code-inner js-file-line"><span class="pl-en">define_one_global_rw</span>(smart_slow_up_load);</td>
+      </tr>
+      <tr>
+        <td id="L693" class="blob-num js-line-number" data-line-number="693"></td>
+        <td id="LC693" class="blob-code blob-code-inner js-file-line"><span class="pl-en">define_one_global_rw</span>(smart_slow_up_freq);</td>
+      </tr>
+      <tr>
+        <td id="L694" class="blob-num js-line-number" data-line-number="694"></td>
+        <td id="LC694" class="blob-code blob-code-inner js-file-line"><span class="pl-en">define_one_global_rw</span>(smart_slow_up_dur);</td>
+      </tr>
+      <tr>
+        <td id="L695" class="blob-num js-line-number" data-line-number="695"></td>
+        <td id="LC695" class="blob-code blob-code-inner js-file-line"><span class="pl-en">define_one_global_rw</span>(smart_high_slow_up_freq);</td>
+      </tr>
+      <tr>
+        <td id="L696" class="blob-num js-line-number" data-line-number="696"></td>
+        <td id="LC696" class="blob-code blob-code-inner js-file-line"><span class="pl-en">define_one_global_rw</span>(smart_high_slow_up_dur);</td>
+      </tr>
+      <tr>
+        <td id="L697" class="blob-num js-line-number" data-line-number="697"></td>
+        <td id="LC697" class="blob-code blob-code-inner js-file-line"><span class="pl-en">define_one_global_rw</span>(smart_each_off);</td>
+      </tr>
+      <tr>
+        <td id="L698" class="blob-num js-line-number" data-line-number="698"></td>
+        <td id="LC698" class="blob-code blob-code-inner js-file-line"><span class="pl-c">/* end smart_up */</span></td>
+      </tr>
+      <tr>
+        <td id="L699" class="blob-num js-line-number" data-line-number="699"></td>
+        <td id="LC699" class="blob-code blob-code-inner js-file-line"><span class="pl-en">define_one_global_rw</span>(freq_step);</td>
+      </tr>
+      <tr>
+        <td id="L700" class="blob-num js-line-number" data-line-number="700"></td>
+        <td id="LC700" class="blob-code blob-code-inner js-file-line"><span class="pl-en">define_one_global_rw</span>(step_up_early_hispeed);</td>
+      </tr>
+      <tr>
+        <td id="L701" class="blob-num js-line-number" data-line-number="701"></td>
+        <td id="LC701" class="blob-code blob-code-inner js-file-line"><span class="pl-en">define_one_global_rw</span>(step_up_interim_hispeed);</td>
+      </tr>
+      <tr>
+        <td id="L702" class="blob-num js-line-number" data-line-number="702"></td>
+        <td id="LC702" class="blob-code blob-code-inner js-file-line"><span class="pl-en">define_one_global_rw</span>(sampling_early_factor);</td>
+      </tr>
+      <tr>
+        <td id="L703" class="blob-num js-line-number" data-line-number="703"></td>
+        <td id="LC703" class="blob-code blob-code-inner js-file-line"><span class="pl-en">define_one_global_rw</span>(sampling_interim_factor);</td>
+      </tr>
+      <tr>
+        <td id="L704" class="blob-num js-line-number" data-line-number="704"></td>
+        <td id="LC704" class="blob-code blob-code-inner js-file-line"><span class="pl-en">define_one_global_rw</span>(two_phase_freq);</td>
+      </tr>
+      <tr>
+        <td id="L705" class="blob-num js-line-number" data-line-number="705"></td>
+        <td id="LC705" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L706" class="blob-num js-line-number" data-line-number="706"></td>
+        <td id="LC706" class="blob-code blob-code-inner js-file-line"><span class="pl-k">static</span> <span class="pl-k">struct</span> attribute *dbs_attributes[] = {</td>
+      </tr>
+      <tr>
+        <td id="L707" class="blob-num js-line-number" data-line-number="707"></td>
+        <td id="LC707" class="blob-code blob-code-inner js-file-line">	&amp;sampling_rate_min.<span class="pl-smi">attr</span>,</td>
+      </tr>
+      <tr>
+        <td id="L708" class="blob-num js-line-number" data-line-number="708"></td>
+        <td id="LC708" class="blob-code blob-code-inner js-file-line">	&amp;sampling_rate.<span class="pl-smi">attr</span>,</td>
+      </tr>
+      <tr>
+        <td id="L709" class="blob-num js-line-number" data-line-number="709"></td>
+        <td id="LC709" class="blob-code blob-code-inner js-file-line">	&amp;up_threshold.<span class="pl-smi">attr</span>,</td>
+      </tr>
+      <tr>
+        <td id="L710" class="blob-num js-line-number" data-line-number="710"></td>
+        <td id="LC710" class="blob-code blob-code-inner js-file-line">	&amp;sampling_down_factor.<span class="pl-smi">attr</span>,</td>
+      </tr>
+      <tr>
+        <td id="L711" class="blob-num js-line-number" data-line-number="711"></td>
+        <td id="LC711" class="blob-code blob-code-inner js-file-line">	&amp;up_threshold_multi_core.<span class="pl-smi">attr</span>,</td>
+      </tr>
+      <tr>
+        <td id="L712" class="blob-num js-line-number" data-line-number="712"></td>
+        <td id="LC712" class="blob-code blob-code-inner js-file-line">	&amp;optimal_freq.<span class="pl-smi">attr</span>,</td>
+      </tr>
+      <tr>
+        <td id="L713" class="blob-num js-line-number" data-line-number="713"></td>
+        <td id="LC713" class="blob-code blob-code-inner js-file-line">	&amp;up_threshold_any_cpu_load.<span class="pl-smi">attr</span>,</td>
+      </tr>
+      <tr>
+        <td id="L714" class="blob-num js-line-number" data-line-number="714"></td>
+        <td id="LC714" class="blob-code blob-code-inner js-file-line">	&amp;sync_freq.<span class="pl-smi">attr</span>,</td>
+      </tr>
+      <tr>
+        <td id="L715" class="blob-num js-line-number" data-line-number="715"></td>
+        <td id="LC715" class="blob-code blob-code-inner js-file-line">	<span class="pl-c">/* 20130711 smart_up */</span></td>
+      </tr>
+      <tr>
+        <td id="L716" class="blob-num js-line-number" data-line-number="716"></td>
+        <td id="LC716" class="blob-code blob-code-inner js-file-line">	&amp;smart_up.<span class="pl-smi">attr</span>,</td>
+      </tr>
+      <tr>
+        <td id="L717" class="blob-num js-line-number" data-line-number="717"></td>
+        <td id="LC717" class="blob-code blob-code-inner js-file-line">	&amp;smart_slow_up_load.<span class="pl-smi">attr</span>,</td>
+      </tr>
+      <tr>
+        <td id="L718" class="blob-num js-line-number" data-line-number="718"></td>
+        <td id="LC718" class="blob-code blob-code-inner js-file-line">	&amp;smart_slow_up_freq.<span class="pl-smi">attr</span>,</td>
+      </tr>
+      <tr>
+        <td id="L719" class="blob-num js-line-number" data-line-number="719"></td>
+        <td id="LC719" class="blob-code blob-code-inner js-file-line">	&amp;smart_slow_up_dur.<span class="pl-smi">attr</span>,</td>
+      </tr>
+      <tr>
+        <td id="L720" class="blob-num js-line-number" data-line-number="720"></td>
+        <td id="LC720" class="blob-code blob-code-inner js-file-line">	&amp;smart_high_slow_up_freq.<span class="pl-smi">attr</span>,</td>
+      </tr>
+      <tr>
+        <td id="L721" class="blob-num js-line-number" data-line-number="721"></td>
+        <td id="LC721" class="blob-code blob-code-inner js-file-line">	&amp;smart_high_slow_up_dur.<span class="pl-smi">attr</span>,</td>
+      </tr>
+      <tr>
+        <td id="L722" class="blob-num js-line-number" data-line-number="722"></td>
+        <td id="LC722" class="blob-code blob-code-inner js-file-line">	&amp;smart_each_off.<span class="pl-smi">attr</span>,</td>
+      </tr>
+      <tr>
+        <td id="L723" class="blob-num js-line-number" data-line-number="723"></td>
+        <td id="LC723" class="blob-code blob-code-inner js-file-line">	<span class="pl-c">/* end smart_up */</span></td>
+      </tr>
+      <tr>
+        <td id="L724" class="blob-num js-line-number" data-line-number="724"></td>
+        <td id="LC724" class="blob-code blob-code-inner js-file-line">	&amp;freq_step.<span class="pl-smi">attr</span>,</td>
+      </tr>
+      <tr>
+        <td id="L725" class="blob-num js-line-number" data-line-number="725"></td>
+        <td id="LC725" class="blob-code blob-code-inner js-file-line">	&amp;step_up_early_hispeed.<span class="pl-smi">attr</span>,</td>
+      </tr>
+      <tr>
+        <td id="L726" class="blob-num js-line-number" data-line-number="726"></td>
+        <td id="LC726" class="blob-code blob-code-inner js-file-line">	&amp;step_up_interim_hispeed.<span class="pl-smi">attr</span>,</td>
+      </tr>
+      <tr>
+        <td id="L727" class="blob-num js-line-number" data-line-number="727"></td>
+        <td id="LC727" class="blob-code blob-code-inner js-file-line">	&amp;sampling_early_factor.<span class="pl-smi">attr</span>,</td>
+      </tr>
+      <tr>
+        <td id="L728" class="blob-num js-line-number" data-line-number="728"></td>
+        <td id="LC728" class="blob-code blob-code-inner js-file-line">	&amp;sampling_interim_factor.<span class="pl-smi">attr</span>,</td>
+      </tr>
+      <tr>
+        <td id="L729" class="blob-num js-line-number" data-line-number="729"></td>
+        <td id="LC729" class="blob-code blob-code-inner js-file-line">	&amp;two_phase_freq.<span class="pl-smi">attr</span>,</td>
+      </tr>
+      <tr>
+        <td id="L730" class="blob-num js-line-number" data-line-number="730"></td>
+        <td id="LC730" class="blob-code blob-code-inner js-file-line">	<span class="pl-c1">NULL</span></td>
+      </tr>
+      <tr>
+        <td id="L731" class="blob-num js-line-number" data-line-number="731"></td>
+        <td id="LC731" class="blob-code blob-code-inner js-file-line">};</td>
+      </tr>
+      <tr>
+        <td id="L732" class="blob-num js-line-number" data-line-number="732"></td>
+        <td id="LC732" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L733" class="blob-num js-line-number" data-line-number="733"></td>
+        <td id="LC733" class="blob-code blob-code-inner js-file-line"><span class="pl-k">static</span> <span class="pl-k">struct</span> attribute_group dbs_attr_group = {</td>
+      </tr>
+      <tr>
+        <td id="L734" class="blob-num js-line-number" data-line-number="734"></td>
+        <td id="LC734" class="blob-code blob-code-inner js-file-line">	.<span class="pl-smi">attrs</span> = dbs_attributes,</td>
+      </tr>
+      <tr>
+        <td id="L735" class="blob-num js-line-number" data-line-number="735"></td>
+        <td id="LC735" class="blob-code blob-code-inner js-file-line">	.<span class="pl-smi">name</span> = <span class="pl-s"><span class="pl-pds">&quot;</span>intellidemand<span class="pl-pds">&quot;</span></span>,</td>
+      </tr>
+      <tr>
+        <td id="L736" class="blob-num js-line-number" data-line-number="736"></td>
+        <td id="LC736" class="blob-code blob-code-inner js-file-line">};</td>
+      </tr>
+      <tr>
+        <td id="L737" class="blob-num js-line-number" data-line-number="737"></td>
+        <td id="LC737" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L738" class="blob-num js-line-number" data-line-number="738"></td>
+        <td id="LC738" class="blob-code blob-code-inner js-file-line"><span class="pl-c">/************************** sysfs end ************************/</span></td>
+      </tr>
+      <tr>
+        <td id="L739" class="blob-num js-line-number" data-line-number="739"></td>
+        <td id="LC739" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L740" class="blob-num js-line-number" data-line-number="740"></td>
+        <td id="LC740" class="blob-code blob-code-inner js-file-line"><span class="pl-k">static</span> <span class="pl-k">void</span> <span class="pl-en">dbs_freq_increase</span>(<span class="pl-k">struct</span> cpufreq_policy *p, <span class="pl-k">unsigned</span> <span class="pl-k">int</span> freq)</td>
+      </tr>
+      <tr>
+        <td id="L741" class="blob-num js-line-number" data-line-number="741"></td>
+        <td id="LC741" class="blob-code blob-code-inner js-file-line">{</td>
+      </tr>
+      <tr>
+        <td id="L742" class="blob-num js-line-number" data-line-number="742"></td>
+        <td id="LC742" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">if</span> (p-&gt;cur == p-&gt;max)</td>
+      </tr>
+      <tr>
+        <td id="L743" class="blob-num js-line-number" data-line-number="743"></td>
+        <td id="LC743" class="blob-code blob-code-inner js-file-line">		<span class="pl-k">return</span>;</td>
+      </tr>
+      <tr>
+        <td id="L744" class="blob-num js-line-number" data-line-number="744"></td>
+        <td id="LC744" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L745" class="blob-num js-line-number" data-line-number="745"></td>
+        <td id="LC745" class="blob-code blob-code-inner js-file-line">	<span class="pl-c1">__cpufreq_driver_target</span>(p, freq, CPUFREQ_RELATION_L);</td>
+      </tr>
+      <tr>
+        <td id="L746" class="blob-num js-line-number" data-line-number="746"></td>
+        <td id="LC746" class="blob-code blob-code-inner js-file-line">}</td>
+      </tr>
+      <tr>
+        <td id="L747" class="blob-num js-line-number" data-line-number="747"></td>
+        <td id="LC747" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L748" class="blob-num js-line-number" data-line-number="748"></td>
+        <td id="LC748" class="blob-code blob-code-inner js-file-line"><span class="pl-k">static</span> <span class="pl-k">void</span> <span class="pl-en">dbs_check_cpu</span>(<span class="pl-k">struct</span> cpu_dbs_info_s *this_dbs_info)</td>
+      </tr>
+      <tr>
+        <td id="L749" class="blob-num js-line-number" data-line-number="749"></td>
+        <td id="LC749" class="blob-code blob-code-inner js-file-line">{</td>
+      </tr>
+      <tr>
+        <td id="L750" class="blob-num js-line-number" data-line-number="750"></td>
+        <td id="LC750" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L751" class="blob-num js-line-number" data-line-number="751"></td>
+        <td id="LC751" class="blob-code blob-code-inner js-file-line">#<span class="pl-k">if</span> defined(SMART_UP_PLUS)</td>
+      </tr>
+      <tr>
+        <td id="L752" class="blob-num js-line-number" data-line-number="752"></td>
+        <td id="LC752" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">unsigned</span> <span class="pl-k">int</span> core_j = <span class="pl-c1">0</span>;</td>
+      </tr>
+      <tr>
+        <td id="L753" class="blob-num js-line-number" data-line-number="753"></td>
+        <td id="LC753" class="blob-code blob-code-inner js-file-line">#<span class="pl-k">endif</span></td>
+      </tr>
+      <tr>
+        <td id="L754" class="blob-num js-line-number" data-line-number="754"></td>
+        <td id="LC754" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L755" class="blob-num js-line-number" data-line-number="755"></td>
+        <td id="LC755" class="blob-code blob-code-inner js-file-line">	<span class="pl-c">/* Extrapolated load of this CPU */</span></td>
+      </tr>
+      <tr>
+        <td id="L756" class="blob-num js-line-number" data-line-number="756"></td>
+        <td id="LC756" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">unsigned</span> <span class="pl-k">int</span> load_at_max_freq = <span class="pl-c1">0</span>;</td>
+      </tr>
+      <tr>
+        <td id="L757" class="blob-num js-line-number" data-line-number="757"></td>
+        <td id="LC757" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">unsigned</span> <span class="pl-k">int</span> max_load_freq;</td>
+      </tr>
+      <tr>
+        <td id="L758" class="blob-num js-line-number" data-line-number="758"></td>
+        <td id="LC758" class="blob-code blob-code-inner js-file-line">	<span class="pl-c">/* Current load across this CPU */</span></td>
+      </tr>
+      <tr>
+        <td id="L759" class="blob-num js-line-number" data-line-number="759"></td>
+        <td id="LC759" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">unsigned</span> <span class="pl-k">int</span> cur_load = <span class="pl-c1">0</span>;</td>
+      </tr>
+      <tr>
+        <td id="L760" class="blob-num js-line-number" data-line-number="760"></td>
+        <td id="LC760" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">unsigned</span> <span class="pl-k">int</span> max_load = <span class="pl-c1">0</span>;</td>
+      </tr>
+      <tr>
+        <td id="L761" class="blob-num js-line-number" data-line-number="761"></td>
+        <td id="LC761" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">unsigned</span> <span class="pl-k">int</span> max_load_other_cpu = <span class="pl-c1">0</span>;</td>
+      </tr>
+      <tr>
+        <td id="L762" class="blob-num js-line-number" data-line-number="762"></td>
+        <td id="LC762" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">struct</span> cpufreq_policy *policy;</td>
+      </tr>
+      <tr>
+        <td id="L763" class="blob-num js-line-number" data-line-number="763"></td>
+        <td id="LC763" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">unsigned</span> <span class="pl-k">int</span> j;</td>
+      </tr>
+      <tr>
+        <td id="L764" class="blob-num js-line-number" data-line-number="764"></td>
+        <td id="LC764" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">static</span> <span class="pl-k">unsigned</span> <span class="pl-k">int</span> phase = <span class="pl-c1">0</span>;</td>
+      </tr>
+      <tr>
+        <td id="L765" class="blob-num js-line-number" data-line-number="765"></td>
+        <td id="LC765" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">static</span> <span class="pl-k">unsigned</span> <span class="pl-k">int</span> counter = <span class="pl-c1">0</span>;</td>
+      </tr>
+      <tr>
+        <td id="L766" class="blob-num js-line-number" data-line-number="766"></td>
+        <td id="LC766" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">unsigned</span> <span class="pl-k">int</span> nr_cpus;</td>
+      </tr>
+      <tr>
+        <td id="L767" class="blob-num js-line-number" data-line-number="767"></td>
+        <td id="LC767" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">unsigned</span> <span class="pl-k">int</span> sampling_rate;</td>
+      </tr>
+      <tr>
+        <td id="L768" class="blob-num js-line-number" data-line-number="768"></td>
+        <td id="LC768" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L769" class="blob-num js-line-number" data-line-number="769"></td>
+        <td id="LC769" class="blob-code blob-code-inner js-file-line">	sampling_rate = dbs_tuners_ins.<span class="pl-smi">sampling_rate</span> * this_dbs_info-&gt;rate_mult;</td>
+      </tr>
+      <tr>
+        <td id="L770" class="blob-num js-line-number" data-line-number="770"></td>
+        <td id="LC770" class="blob-code blob-code-inner js-file-line">	this_dbs_info-&gt;freq_lo = <span class="pl-c1">0</span>;</td>
+      </tr>
+      <tr>
+        <td id="L771" class="blob-num js-line-number" data-line-number="771"></td>
+        <td id="LC771" class="blob-code blob-code-inner js-file-line">	policy = this_dbs_info-&gt;cur_policy;</td>
+      </tr>
+      <tr>
+        <td id="L772" class="blob-num js-line-number" data-line-number="772"></td>
+        <td id="LC772" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">if</span> (policy == <span class="pl-c1">NULL</span>)</td>
+      </tr>
+      <tr>
+        <td id="L773" class="blob-num js-line-number" data-line-number="773"></td>
+        <td id="LC773" class="blob-code blob-code-inner js-file-line">		<span class="pl-k">return</span>;</td>
+      </tr>
+      <tr>
+        <td id="L774" class="blob-num js-line-number" data-line-number="774"></td>
+        <td id="LC774" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L775" class="blob-num js-line-number" data-line-number="775"></td>
+        <td id="LC775" class="blob-code blob-code-inner js-file-line">	<span class="pl-c">/*</span></td>
+      </tr>
+      <tr>
+        <td id="L776" class="blob-num js-line-number" data-line-number="776"></td>
+        <td id="LC776" class="blob-code blob-code-inner js-file-line"><span class="pl-c">	 * Every sampling_rate, we check, if current idle time is less</span></td>
+      </tr>
+      <tr>
+        <td id="L777" class="blob-num js-line-number" data-line-number="777"></td>
+        <td id="LC777" class="blob-code blob-code-inner js-file-line"><span class="pl-c">	 * than 20% (default), then we try to increase frequency</span></td>
+      </tr>
+      <tr>
+        <td id="L778" class="blob-num js-line-number" data-line-number="778"></td>
+        <td id="LC778" class="blob-code blob-code-inner js-file-line"><span class="pl-c">	 * Every sampling_rate, we look for a the lowest</span></td>
+      </tr>
+      <tr>
+        <td id="L779" class="blob-num js-line-number" data-line-number="779"></td>
+        <td id="LC779" class="blob-code blob-code-inner js-file-line"><span class="pl-c">	 * frequency which can sustain the load while keeping idle time over</span></td>
+      </tr>
+      <tr>
+        <td id="L780" class="blob-num js-line-number" data-line-number="780"></td>
+        <td id="LC780" class="blob-code blob-code-inner js-file-line"><span class="pl-c">	 * 30%. If such a frequency exist, we try to decrease to this frequency.</span></td>
+      </tr>
+      <tr>
+        <td id="L781" class="blob-num js-line-number" data-line-number="781"></td>
+        <td id="LC781" class="blob-code blob-code-inner js-file-line"><span class="pl-c">	 *</span></td>
+      </tr>
+      <tr>
+        <td id="L782" class="blob-num js-line-number" data-line-number="782"></td>
+        <td id="LC782" class="blob-code blob-code-inner js-file-line"><span class="pl-c">	 * Any frequency increase takes it to the maximum frequency.</span></td>
+      </tr>
+      <tr>
+        <td id="L783" class="blob-num js-line-number" data-line-number="783"></td>
+        <td id="LC783" class="blob-code blob-code-inner js-file-line"><span class="pl-c">	 * Frequency reduction happens at minimum steps of</span></td>
+      </tr>
+      <tr>
+        <td id="L784" class="blob-num js-line-number" data-line-number="784"></td>
+        <td id="LC784" class="blob-code blob-code-inner js-file-line"><span class="pl-c">	 * 5% (default) of current frequency</span></td>
+      </tr>
+      <tr>
+        <td id="L785" class="blob-num js-line-number" data-line-number="785"></td>
+        <td id="LC785" class="blob-code blob-code-inner js-file-line"><span class="pl-c">	 */</span></td>
+      </tr>
+      <tr>
+        <td id="L786" class="blob-num js-line-number" data-line-number="786"></td>
+        <td id="LC786" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L787" class="blob-num js-line-number" data-line-number="787"></td>
+        <td id="LC787" class="blob-code blob-code-inner js-file-line">	<span class="pl-c">/* Get Absolute Load - in terms of freq */</span></td>
+      </tr>
+      <tr>
+        <td id="L788" class="blob-num js-line-number" data-line-number="788"></td>
+        <td id="LC788" class="blob-code blob-code-inner js-file-line">	max_load_freq = <span class="pl-c1">0</span>;</td>
+      </tr>
+      <tr>
+        <td id="L789" class="blob-num js-line-number" data-line-number="789"></td>
+        <td id="LC789" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L790" class="blob-num js-line-number" data-line-number="790"></td>
+        <td id="LC790" class="blob-code blob-code-inner js-file-line">	<span class="pl-c1">for_each_cpu</span>(j, policy-&gt;cpus) {</td>
+      </tr>
+      <tr>
+        <td id="L791" class="blob-num js-line-number" data-line-number="791"></td>
+        <td id="LC791" class="blob-code blob-code-inner js-file-line">		<span class="pl-k">struct</span> cpu_dbs_info_s *j_dbs_info;</td>
+      </tr>
+      <tr>
+        <td id="L792" class="blob-num js-line-number" data-line-number="792"></td>
+        <td id="LC792" class="blob-code blob-code-inner js-file-line">		u64 cur_wall_time, cur_idle_time;</td>
+      </tr>
+      <tr>
+        <td id="L793" class="blob-num js-line-number" data-line-number="793"></td>
+        <td id="LC793" class="blob-code blob-code-inner js-file-line">		<span class="pl-k">unsigned</span> <span class="pl-k">int</span> idle_time, wall_time;</td>
+      </tr>
+      <tr>
+        <td id="L794" class="blob-num js-line-number" data-line-number="794"></td>
+        <td id="LC794" class="blob-code blob-code-inner js-file-line">		<span class="pl-k">unsigned</span> <span class="pl-k">int</span> load_freq;</td>
+      </tr>
+      <tr>
+        <td id="L795" class="blob-num js-line-number" data-line-number="795"></td>
+        <td id="LC795" class="blob-code blob-code-inner js-file-line">		<span class="pl-k">int</span> freq_avg;</td>
+      </tr>
+      <tr>
+        <td id="L796" class="blob-num js-line-number" data-line-number="796"></td>
+        <td id="LC796" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L797" class="blob-num js-line-number" data-line-number="797"></td>
+        <td id="LC797" class="blob-code blob-code-inner js-file-line">		j_dbs_info = &amp;<span class="pl-c1">per_cpu</span>(id_cpu_dbs_info, j);</td>
+      </tr>
+      <tr>
+        <td id="L798" class="blob-num js-line-number" data-line-number="798"></td>
+        <td id="LC798" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L799" class="blob-num js-line-number" data-line-number="799"></td>
+        <td id="LC799" class="blob-code blob-code-inner js-file-line">		cur_idle_time = <span class="pl-c1">get_cpu_idle_time</span>(j, &amp;cur_wall_time, <span class="pl-c1">0</span>);</td>
+      </tr>
+      <tr>
+        <td id="L800" class="blob-num js-line-number" data-line-number="800"></td>
+        <td id="LC800" class="blob-code blob-code-inner js-file-line">		wall_time = (<span class="pl-k">unsigned</span> <span class="pl-k">int</span>)</td>
+      </tr>
+      <tr>
+        <td id="L801" class="blob-num js-line-number" data-line-number="801"></td>
+        <td id="LC801" class="blob-code blob-code-inner js-file-line">			(cur_wall_time - j_dbs_info-&gt;prev_cpu_wall);</td>
+      </tr>
+      <tr>
+        <td id="L802" class="blob-num js-line-number" data-line-number="802"></td>
+        <td id="LC802" class="blob-code blob-code-inner js-file-line">		j_dbs_info-&gt;prev_cpu_wall = cur_wall_time;</td>
+      </tr>
+      <tr>
+        <td id="L803" class="blob-num js-line-number" data-line-number="803"></td>
+        <td id="LC803" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L804" class="blob-num js-line-number" data-line-number="804"></td>
+        <td id="LC804" class="blob-code blob-code-inner js-file-line">		idle_time = (<span class="pl-k">unsigned</span> <span class="pl-k">int</span>)</td>
+      </tr>
+      <tr>
+        <td id="L805" class="blob-num js-line-number" data-line-number="805"></td>
+        <td id="LC805" class="blob-code blob-code-inner js-file-line">			(cur_idle_time - j_dbs_info-&gt;prev_cpu_idle);</td>
+      </tr>
+      <tr>
+        <td id="L806" class="blob-num js-line-number" data-line-number="806"></td>
+        <td id="LC806" class="blob-code blob-code-inner js-file-line">		j_dbs_info-&gt;prev_cpu_idle = cur_idle_time;</td>
+      </tr>
+      <tr>
+        <td id="L807" class="blob-num js-line-number" data-line-number="807"></td>
+        <td id="LC807" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L808" class="blob-num js-line-number" data-line-number="808"></td>
+        <td id="LC808" class="blob-code blob-code-inner js-file-line">		<span class="pl-c">/*</span></td>
+      </tr>
+      <tr>
+        <td id="L809" class="blob-num js-line-number" data-line-number="809"></td>
+        <td id="LC809" class="blob-code blob-code-inner js-file-line"><span class="pl-c">		 * For the purpose of intellidemand, waiting for disk IO is an</span></td>
+      </tr>
+      <tr>
+        <td id="L810" class="blob-num js-line-number" data-line-number="810"></td>
+        <td id="LC810" class="blob-code blob-code-inner js-file-line"><span class="pl-c">		 * indication that you&#39;re performance critical, and not that</span></td>
+      </tr>
+      <tr>
+        <td id="L811" class="blob-num js-line-number" data-line-number="811"></td>
+        <td id="LC811" class="blob-code blob-code-inner js-file-line"><span class="pl-c">		 * the system is actually idle. So subtract the iowait time</span></td>
+      </tr>
+      <tr>
+        <td id="L812" class="blob-num js-line-number" data-line-number="812"></td>
+        <td id="LC812" class="blob-code blob-code-inner js-file-line"><span class="pl-c">		 * from the cpu idle time.</span></td>
+      </tr>
+      <tr>
+        <td id="L813" class="blob-num js-line-number" data-line-number="813"></td>
+        <td id="LC813" class="blob-code blob-code-inner js-file-line"><span class="pl-c">		 */</span></td>
+      </tr>
+      <tr>
+        <td id="L814" class="blob-num js-line-number" data-line-number="814"></td>
+        <td id="LC814" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L815" class="blob-num js-line-number" data-line-number="815"></td>
+        <td id="LC815" class="blob-code blob-code-inner js-file-line">		<span class="pl-k">if</span> (<span class="pl-c1">unlikely</span>(!wall_time || wall_time &lt; idle_time))</td>
+      </tr>
+      <tr>
+        <td id="L816" class="blob-num js-line-number" data-line-number="816"></td>
+        <td id="LC816" class="blob-code blob-code-inner js-file-line">			<span class="pl-k">continue</span>;</td>
+      </tr>
+      <tr>
+        <td id="L817" class="blob-num js-line-number" data-line-number="817"></td>
+        <td id="LC817" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L818" class="blob-num js-line-number" data-line-number="818"></td>
+        <td id="LC818" class="blob-code blob-code-inner js-file-line">		<span class="pl-c">/*</span></td>
+      </tr>
+      <tr>
+        <td id="L819" class="blob-num js-line-number" data-line-number="819"></td>
+        <td id="LC819" class="blob-code blob-code-inner js-file-line"><span class="pl-c">		 * If the CPU had gone completely idle, and a task just woke up</span></td>
+      </tr>
+      <tr>
+        <td id="L820" class="blob-num js-line-number" data-line-number="820"></td>
+        <td id="LC820" class="blob-code blob-code-inner js-file-line"><span class="pl-c">		 * on this CPU now, it would be unfair to calculate &#39;load&#39; the</span></td>
+      </tr>
+      <tr>
+        <td id="L821" class="blob-num js-line-number" data-line-number="821"></td>
+        <td id="LC821" class="blob-code blob-code-inner js-file-line"><span class="pl-c">		 * usual way for this elapsed time-window, because it will show</span></td>
+      </tr>
+      <tr>
+        <td id="L822" class="blob-num js-line-number" data-line-number="822"></td>
+        <td id="LC822" class="blob-code blob-code-inner js-file-line"><span class="pl-c">		 * near-zero load, irrespective of how CPU intensive that task</span></td>
+      </tr>
+      <tr>
+        <td id="L823" class="blob-num js-line-number" data-line-number="823"></td>
+        <td id="LC823" class="blob-code blob-code-inner js-file-line"><span class="pl-c">		 * actually is. This is undesirable for latency-sensitive bursty</span></td>
+      </tr>
+      <tr>
+        <td id="L824" class="blob-num js-line-number" data-line-number="824"></td>
+        <td id="LC824" class="blob-code blob-code-inner js-file-line"><span class="pl-c">		 * workloads.</span></td>
+      </tr>
+      <tr>
+        <td id="L825" class="blob-num js-line-number" data-line-number="825"></td>
+        <td id="LC825" class="blob-code blob-code-inner js-file-line"><span class="pl-c">		 *</span></td>
+      </tr>
+      <tr>
+        <td id="L826" class="blob-num js-line-number" data-line-number="826"></td>
+        <td id="LC826" class="blob-code blob-code-inner js-file-line"><span class="pl-c">		 * To avoid this, we reuse the &#39;load&#39; from the previous</span></td>
+      </tr>
+      <tr>
+        <td id="L827" class="blob-num js-line-number" data-line-number="827"></td>
+        <td id="LC827" class="blob-code blob-code-inner js-file-line"><span class="pl-c">		 * time-window and give this task a chance to start with a</span></td>
+      </tr>
+      <tr>
+        <td id="L828" class="blob-num js-line-number" data-line-number="828"></td>
+        <td id="LC828" class="blob-code blob-code-inner js-file-line"><span class="pl-c">		 * reasonably high CPU frequency. (However, we shouldn&#39;t over-do</span></td>
+      </tr>
+      <tr>
+        <td id="L829" class="blob-num js-line-number" data-line-number="829"></td>
+        <td id="LC829" class="blob-code blob-code-inner js-file-line"><span class="pl-c">		 * this copy, lest we get stuck at a high load (high frequency)</span></td>
+      </tr>
+      <tr>
+        <td id="L830" class="blob-num js-line-number" data-line-number="830"></td>
+        <td id="LC830" class="blob-code blob-code-inner js-file-line"><span class="pl-c">		 * for too long, even when the current system load has actually</span></td>
+      </tr>
+      <tr>
+        <td id="L831" class="blob-num js-line-number" data-line-number="831"></td>
+        <td id="LC831" class="blob-code blob-code-inner js-file-line"><span class="pl-c">		 * dropped down. So we perform the copy only once, upon the</span></td>
+      </tr>
+      <tr>
+        <td id="L832" class="blob-num js-line-number" data-line-number="832"></td>
+        <td id="LC832" class="blob-code blob-code-inner js-file-line"><span class="pl-c">		 * first wake-up from idle.)</span></td>
+      </tr>
+      <tr>
+        <td id="L833" class="blob-num js-line-number" data-line-number="833"></td>
+        <td id="LC833" class="blob-code blob-code-inner js-file-line"><span class="pl-c">		 *</span></td>
+      </tr>
+      <tr>
+        <td id="L834" class="blob-num js-line-number" data-line-number="834"></td>
+        <td id="LC834" class="blob-code blob-code-inner js-file-line"><span class="pl-c">		 * Detecting this situation is easy: the governor&#39;s deferrable</span></td>
+      </tr>
+      <tr>
+        <td id="L835" class="blob-num js-line-number" data-line-number="835"></td>
+        <td id="LC835" class="blob-code blob-code-inner js-file-line"><span class="pl-c">		 * timer would not have fired during CPU-idle periods. Hence</span></td>
+      </tr>
+      <tr>
+        <td id="L836" class="blob-num js-line-number" data-line-number="836"></td>
+        <td id="LC836" class="blob-code blob-code-inner js-file-line"><span class="pl-c">		 * an unusually large &#39;wall_time&#39; (as compared to the sampling</span></td>
+      </tr>
+      <tr>
+        <td id="L837" class="blob-num js-line-number" data-line-number="837"></td>
+        <td id="LC837" class="blob-code blob-code-inner js-file-line"><span class="pl-c">		 * rate) indicates this scenario.</span></td>
+      </tr>
+      <tr>
+        <td id="L838" class="blob-num js-line-number" data-line-number="838"></td>
+        <td id="LC838" class="blob-code blob-code-inner js-file-line"><span class="pl-c">		 *</span></td>
+      </tr>
+      <tr>
+        <td id="L839" class="blob-num js-line-number" data-line-number="839"></td>
+        <td id="LC839" class="blob-code blob-code-inner js-file-line"><span class="pl-c">		 * prev_load can be zero in two cases and we must recalculate it</span></td>
+      </tr>
+      <tr>
+        <td id="L840" class="blob-num js-line-number" data-line-number="840"></td>
+        <td id="LC840" class="blob-code blob-code-inner js-file-line"><span class="pl-c">		 * for both cases:</span></td>
+      </tr>
+      <tr>
+        <td id="L841" class="blob-num js-line-number" data-line-number="841"></td>
+        <td id="LC841" class="blob-code blob-code-inner js-file-line"><span class="pl-c">		 * - during long idle intervals</span></td>
+      </tr>
+      <tr>
+        <td id="L842" class="blob-num js-line-number" data-line-number="842"></td>
+        <td id="LC842" class="blob-code blob-code-inner js-file-line"><span class="pl-c">		 * - explicitly set to zero</span></td>
+      </tr>
+      <tr>
+        <td id="L843" class="blob-num js-line-number" data-line-number="843"></td>
+        <td id="LC843" class="blob-code blob-code-inner js-file-line"><span class="pl-c">		 */</span></td>
+      </tr>
+      <tr>
+        <td id="L844" class="blob-num js-line-number" data-line-number="844"></td>
+        <td id="LC844" class="blob-code blob-code-inner js-file-line">		<span class="pl-k">if</span> (<span class="pl-c1">unlikely</span>(wall_time &gt; (<span class="pl-c1">2</span> * sampling_rate) &amp;&amp;</td>
+      </tr>
+      <tr>
+        <td id="L845" class="blob-num js-line-number" data-line-number="845"></td>
+        <td id="LC845" class="blob-code blob-code-inner js-file-line">			     j_dbs_info-&gt;prev_load)) {</td>
+      </tr>
+      <tr>
+        <td id="L846" class="blob-num js-line-number" data-line-number="846"></td>
+        <td id="LC846" class="blob-code blob-code-inner js-file-line">			cur_load = j_dbs_info-&gt;prev_load;</td>
+      </tr>
+      <tr>
+        <td id="L847" class="blob-num js-line-number" data-line-number="847"></td>
+        <td id="LC847" class="blob-code blob-code-inner js-file-line">			j_dbs_info-&gt;max_load = cur_load;</td>
+      </tr>
+      <tr>
+        <td id="L848" class="blob-num js-line-number" data-line-number="848"></td>
+        <td id="LC848" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L849" class="blob-num js-line-number" data-line-number="849"></td>
+        <td id="LC849" class="blob-code blob-code-inner js-file-line">			<span class="pl-c">/*</span></td>
+      </tr>
+      <tr>
+        <td id="L850" class="blob-num js-line-number" data-line-number="850"></td>
+        <td id="LC850" class="blob-code blob-code-inner js-file-line"><span class="pl-c">			 * Perform a destructive copy, to ensure that we copy</span></td>
+      </tr>
+      <tr>
+        <td id="L851" class="blob-num js-line-number" data-line-number="851"></td>
+        <td id="LC851" class="blob-code blob-code-inner js-file-line"><span class="pl-c">			 * the previous load only once, upon the first wake-up</span></td>
+      </tr>
+      <tr>
+        <td id="L852" class="blob-num js-line-number" data-line-number="852"></td>
+        <td id="LC852" class="blob-code blob-code-inner js-file-line"><span class="pl-c">			 * from idle.</span></td>
+      </tr>
+      <tr>
+        <td id="L853" class="blob-num js-line-number" data-line-number="853"></td>
+        <td id="LC853" class="blob-code blob-code-inner js-file-line"><span class="pl-c">			 */</span></td>
+      </tr>
+      <tr>
+        <td id="L854" class="blob-num js-line-number" data-line-number="854"></td>
+        <td id="LC854" class="blob-code blob-code-inner js-file-line">			j_dbs_info-&gt;prev_load = <span class="pl-c1">0</span>;</td>
+      </tr>
+      <tr>
+        <td id="L855" class="blob-num js-line-number" data-line-number="855"></td>
+        <td id="LC855" class="blob-code blob-code-inner js-file-line">		} <span class="pl-k">else</span> {</td>
+      </tr>
+      <tr>
+        <td id="L856" class="blob-num js-line-number" data-line-number="856"></td>
+        <td id="LC856" class="blob-code blob-code-inner js-file-line">			cur_load = <span class="pl-c1">100</span> * (wall_time - idle_time) / wall_time;</td>
+      </tr>
+      <tr>
+        <td id="L857" class="blob-num js-line-number" data-line-number="857"></td>
+        <td id="LC857" class="blob-code blob-code-inner js-file-line">			j_dbs_info-&gt;max_load = <span class="pl-c1">max</span>(cur_load, j_dbs_info-&gt;prev_load);</td>
+      </tr>
+      <tr>
+        <td id="L858" class="blob-num js-line-number" data-line-number="858"></td>
+        <td id="LC858" class="blob-code blob-code-inner js-file-line">			j_dbs_info-&gt;prev_load = cur_load;</td>
+      </tr>
+      <tr>
+        <td id="L859" class="blob-num js-line-number" data-line-number="859"></td>
+        <td id="LC859" class="blob-code blob-code-inner js-file-line">		}</td>
+      </tr>
+      <tr>
+        <td id="L860" class="blob-num js-line-number" data-line-number="860"></td>
+        <td id="LC860" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L861" class="blob-num js-line-number" data-line-number="861"></td>
+        <td id="LC861" class="blob-code blob-code-inner js-file-line">		<span class="pl-k">if</span> (cur_load &gt; max_load)</td>
+      </tr>
+      <tr>
+        <td id="L862" class="blob-num js-line-number" data-line-number="862"></td>
+        <td id="LC862" class="blob-code blob-code-inner js-file-line">			max_load = cur_load;</td>
+      </tr>
+      <tr>
+        <td id="L863" class="blob-num js-line-number" data-line-number="863"></td>
+        <td id="LC863" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L864" class="blob-num js-line-number" data-line-number="864"></td>
+        <td id="LC864" class="blob-code blob-code-inner js-file-line">		freq_avg = <span class="pl-c1">__cpufreq_driver_getavg</span>(policy, j);</td>
+      </tr>
+      <tr>
+        <td id="L865" class="blob-num js-line-number" data-line-number="865"></td>
+        <td id="LC865" class="blob-code blob-code-inner js-file-line">		<span class="pl-k">if</span> (policy == <span class="pl-c1">NULL</span>)</td>
+      </tr>
+      <tr>
+        <td id="L866" class="blob-num js-line-number" data-line-number="866"></td>
+        <td id="LC866" class="blob-code blob-code-inner js-file-line">			<span class="pl-k">return</span>;</td>
+      </tr>
+      <tr>
+        <td id="L867" class="blob-num js-line-number" data-line-number="867"></td>
+        <td id="LC867" class="blob-code blob-code-inner js-file-line">		<span class="pl-k">if</span> (freq_avg &lt;= <span class="pl-c1">0</span>)</td>
+      </tr>
+      <tr>
+        <td id="L868" class="blob-num js-line-number" data-line-number="868"></td>
+        <td id="LC868" class="blob-code blob-code-inner js-file-line">			freq_avg = policy-&gt;cur;</td>
+      </tr>
+      <tr>
+        <td id="L869" class="blob-num js-line-number" data-line-number="869"></td>
+        <td id="LC869" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L870" class="blob-num js-line-number" data-line-number="870"></td>
+        <td id="LC870" class="blob-code blob-code-inner js-file-line">		load_freq = cur_load * freq_avg;</td>
+      </tr>
+      <tr>
+        <td id="L871" class="blob-num js-line-number" data-line-number="871"></td>
+        <td id="LC871" class="blob-code blob-code-inner js-file-line">		<span class="pl-k">if</span> (load_freq &gt; max_load_freq)</td>
+      </tr>
+      <tr>
+        <td id="L872" class="blob-num js-line-number" data-line-number="872"></td>
+        <td id="LC872" class="blob-code blob-code-inner js-file-line">			max_load_freq = load_freq;</td>
+      </tr>
+      <tr>
+        <td id="L873" class="blob-num js-line-number" data-line-number="873"></td>
+        <td id="LC873" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L874" class="blob-num js-line-number" data-line-number="874"></td>
+        <td id="LC874" class="blob-code blob-code-inner js-file-line">#<span class="pl-k">if</span> defined(SMART_UP_PLUS)</td>
+      </tr>
+      <tr>
+        <td id="L875" class="blob-num js-line-number" data-line-number="875"></td>
+        <td id="LC875" class="blob-code blob-code-inner js-file-line">		max_load = cur_load;</td>
+      </tr>
+      <tr>
+        <td id="L876" class="blob-num js-line-number" data-line-number="876"></td>
+        <td id="LC876" class="blob-code blob-code-inner js-file-line">		core_j = j;</td>
+      </tr>
+      <tr>
+        <td id="L877" class="blob-num js-line-number" data-line-number="877"></td>
+        <td id="LC877" class="blob-code blob-code-inner js-file-line">#<span class="pl-k">endif</span></td>
+      </tr>
+      <tr>
+        <td id="L878" class="blob-num js-line-number" data-line-number="878"></td>
+        <td id="LC878" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L879" class="blob-num js-line-number" data-line-number="879"></td>
+        <td id="LC879" class="blob-code blob-code-inner js-file-line">	}</td>
+      </tr>
+      <tr>
+        <td id="L880" class="blob-num js-line-number" data-line-number="880"></td>
+        <td id="LC880" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L881" class="blob-num js-line-number" data-line-number="881"></td>
+        <td id="LC881" class="blob-code blob-code-inner js-file-line">	<span class="pl-c1">for_each_online_cpu</span>(j) {</td>
+      </tr>
+      <tr>
+        <td id="L882" class="blob-num js-line-number" data-line-number="882"></td>
+        <td id="LC882" class="blob-code blob-code-inner js-file-line">		<span class="pl-k">struct</span> cpu_dbs_info_s *j_dbs_info;</td>
+      </tr>
+      <tr>
+        <td id="L883" class="blob-num js-line-number" data-line-number="883"></td>
+        <td id="LC883" class="blob-code blob-code-inner js-file-line">		j_dbs_info = &amp;<span class="pl-c1">per_cpu</span>(id_cpu_dbs_info, j);</td>
+      </tr>
+      <tr>
+        <td id="L884" class="blob-num js-line-number" data-line-number="884"></td>
+        <td id="LC884" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L885" class="blob-num js-line-number" data-line-number="885"></td>
+        <td id="LC885" class="blob-code blob-code-inner js-file-line">		<span class="pl-k">if</span> (j == policy-&gt;cpu)</td>
+      </tr>
+      <tr>
+        <td id="L886" class="blob-num js-line-number" data-line-number="886"></td>
+        <td id="LC886" class="blob-code blob-code-inner js-file-line">			<span class="pl-k">continue</span>;</td>
+      </tr>
+      <tr>
+        <td id="L887" class="blob-num js-line-number" data-line-number="887"></td>
+        <td id="LC887" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L888" class="blob-num js-line-number" data-line-number="888"></td>
+        <td id="LC888" class="blob-code blob-code-inner js-file-line">		<span class="pl-k">if</span> (max_load_other_cpu &lt; j_dbs_info-&gt;max_load)</td>
+      </tr>
+      <tr>
+        <td id="L889" class="blob-num js-line-number" data-line-number="889"></td>
+        <td id="LC889" class="blob-code blob-code-inner js-file-line">			max_load_other_cpu = j_dbs_info-&gt;max_load;</td>
+      </tr>
+      <tr>
+        <td id="L890" class="blob-num js-line-number" data-line-number="890"></td>
+        <td id="LC890" class="blob-code blob-code-inner js-file-line">	}</td>
+      </tr>
+      <tr>
+        <td id="L891" class="blob-num js-line-number" data-line-number="891"></td>
+        <td id="LC891" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L892" class="blob-num js-line-number" data-line-number="892"></td>
+        <td id="LC892" class="blob-code blob-code-inner js-file-line">	<span class="pl-c">/* calculate the scaled load across CPU */</span></td>
+      </tr>
+      <tr>
+        <td id="L893" class="blob-num js-line-number" data-line-number="893"></td>
+        <td id="LC893" class="blob-code blob-code-inner js-file-line">	load_at_max_freq = (cur_load * policy-&gt;cur)/policy-&gt;max;</td>
+      </tr>
+      <tr>
+        <td id="L894" class="blob-num js-line-number" data-line-number="894"></td>
+        <td id="LC894" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L895" class="blob-num js-line-number" data-line-number="895"></td>
+        <td id="LC895" class="blob-code blob-code-inner js-file-line">	<span class="pl-c1">cpufreq_notify_utilization</span>(policy, load_at_max_freq);</td>
+      </tr>
+      <tr>
+        <td id="L896" class="blob-num js-line-number" data-line-number="896"></td>
+        <td id="LC896" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L897" class="blob-num js-line-number" data-line-number="897"></td>
+        <td id="LC897" class="blob-code blob-code-inner js-file-line"><span class="pl-c">/* PATCH : SMART_UP */</span></td>
+      </tr>
+      <tr>
+        <td id="L898" class="blob-num js-line-number" data-line-number="898"></td>
+        <td id="LC898" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">if</span> (dbs_tuners_ins.<span class="pl-smi">smart_up</span> &amp;&amp; (core_j + <span class="pl-c1">1</span>) &gt;</td>
+      </tr>
+      <tr>
+        <td id="L899" class="blob-num js-line-number" data-line-number="899"></td>
+        <td id="LC899" class="blob-code blob-code-inner js-file-line">				dbs_tuners_ins.<span class="pl-smi">smart_each_off</span>) {</td>
+      </tr>
+      <tr>
+        <td id="L900" class="blob-num js-line-number" data-line-number="900"></td>
+        <td id="LC900" class="blob-code blob-code-inner js-file-line">		<span class="pl-k">if</span> (max_load_freq &gt; SUP_THRESHOLD_STEPS[<span class="pl-c1">0</span>] * policy-&gt;cur) {</td>
+      </tr>
+      <tr>
+        <td id="L901" class="blob-num js-line-number" data-line-number="901"></td>
+        <td id="LC901" class="blob-code blob-code-inner js-file-line">			<span class="pl-k">int</span> smart_up_inc =</td>
+      </tr>
+      <tr>
+        <td id="L902" class="blob-num js-line-number" data-line-number="902"></td>
+        <td id="LC902" class="blob-code blob-code-inner js-file-line">				(policy-&gt;max - policy-&gt;cur) / SUP_FREQ_STEPS[<span class="pl-c1">0</span>];</td>
+      </tr>
+      <tr>
+        <td id="L903" class="blob-num js-line-number" data-line-number="903"></td>
+        <td id="LC903" class="blob-code blob-code-inner js-file-line">			<span class="pl-k">int</span> freq_next = <span class="pl-c1">0</span>;</td>
+      </tr>
+      <tr>
+        <td id="L904" class="blob-num js-line-number" data-line-number="904"></td>
+        <td id="LC904" class="blob-code blob-code-inner js-file-line">			<span class="pl-k">int</span> i = <span class="pl-c1">0</span>;</td>
+      </tr>
+      <tr>
+        <td id="L905" class="blob-num js-line-number" data-line-number="905"></td>
+        <td id="LC905" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L906" class="blob-num js-line-number" data-line-number="906"></td>
+        <td id="LC906" class="blob-code blob-code-inner js-file-line">			<span class="pl-c">/* 20130429 UPDATE */</span></td>
+      </tr>
+      <tr>
+        <td id="L907" class="blob-num js-line-number" data-line-number="907"></td>
+        <td id="LC907" class="blob-code blob-code-inner js-file-line">			<span class="pl-k">int</span> check_idx =  <span class="pl-c1">0</span>;</td>
+      </tr>
+      <tr>
+        <td id="L908" class="blob-num js-line-number" data-line-number="908"></td>
+        <td id="LC908" class="blob-code blob-code-inner js-file-line">			<span class="pl-k">int</span> check_freq = <span class="pl-c1">0</span>;</td>
+      </tr>
+      <tr>
+        <td id="L909" class="blob-num js-line-number" data-line-number="909"></td>
+        <td id="LC909" class="blob-code blob-code-inner js-file-line">			<span class="pl-k">int</span> temp_up_inc =<span class="pl-c1">0</span>;</td>
+      </tr>
+      <tr>
+        <td id="L910" class="blob-num js-line-number" data-line-number="910"></td>
+        <td id="LC910" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L911" class="blob-num js-line-number" data-line-number="911"></td>
+        <td id="LC911" class="blob-code blob-code-inner js-file-line">			<span class="pl-k">if</span> (counter &lt; <span class="pl-c1">5</span>) {</td>
+      </tr>
+      <tr>
+        <td id="L912" class="blob-num js-line-number" data-line-number="912"></td>
+        <td id="LC912" class="blob-code blob-code-inner js-file-line">				counter++;</td>
+      </tr>
+      <tr>
+        <td id="L913" class="blob-num js-line-number" data-line-number="913"></td>
+        <td id="LC913" class="blob-code blob-code-inner js-file-line">				<span class="pl-k">if</span> (counter &gt; <span class="pl-c1">2</span>) {</td>
+      </tr>
+      <tr>
+        <td id="L914" class="blob-num js-line-number" data-line-number="914"></td>
+        <td id="LC914" class="blob-code blob-code-inner js-file-line">					phase = <span class="pl-c1">1</span>;</td>
+      </tr>
+      <tr>
+        <td id="L915" class="blob-num js-line-number" data-line-number="915"></td>
+        <td id="LC915" class="blob-code blob-code-inner js-file-line">				}</td>
+      </tr>
+      <tr>
+        <td id="L916" class="blob-num js-line-number" data-line-number="916"></td>
+        <td id="LC916" class="blob-code blob-code-inner js-file-line">			}</td>
+      </tr>
+      <tr>
+        <td id="L917" class="blob-num js-line-number" data-line-number="917"></td>
+        <td id="LC917" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L918" class="blob-num js-line-number" data-line-number="918"></td>
+        <td id="LC918" class="blob-code blob-code-inner js-file-line">			nr_cpus = <span class="pl-c1">num_online_cpus</span>();</td>
+      </tr>
+      <tr>
+        <td id="L919" class="blob-num js-line-number" data-line-number="919"></td>
+        <td id="LC919" class="blob-code blob-code-inner js-file-line">			dbs_tuners_ins.<span class="pl-smi">two_phase_freq</span> = two_phase_freq_array[nr_cpus-<span class="pl-c1">1</span>];</td>
+      </tr>
+      <tr>
+        <td id="L920" class="blob-num js-line-number" data-line-number="920"></td>
+        <td id="LC920" class="blob-code blob-code-inner js-file-line">			<span class="pl-k">if</span> (dbs_tuners_ins.<span class="pl-smi">two_phase_freq</span> &lt; policy-&gt;cur)</td>
+      </tr>
+      <tr>
+        <td id="L921" class="blob-num js-line-number" data-line-number="921"></td>
+        <td id="LC921" class="blob-code blob-code-inner js-file-line">				phase = <span class="pl-c1">1</span>;</td>
+      </tr>
+      <tr>
+        <td id="L922" class="blob-num js-line-number" data-line-number="922"></td>
+        <td id="LC922" class="blob-code blob-code-inner js-file-line">			<span class="pl-k">if</span> (dbs_tuners_ins.<span class="pl-smi">two_phase_freq</span> != <span class="pl-c1">0</span> &amp;&amp; phase == <span class="pl-c1">0</span>) {</td>
+      </tr>
+      <tr>
+        <td id="L923" class="blob-num js-line-number" data-line-number="923"></td>
+        <td id="LC923" class="blob-code blob-code-inner js-file-line">				<span class="pl-c1">dbs_freq_increase</span>(policy, dbs_tuners_ins.<span class="pl-smi">two_phase_freq</span>);</td>
+      </tr>
+      <tr>
+        <td id="L924" class="blob-num js-line-number" data-line-number="924"></td>
+        <td id="LC924" class="blob-code blob-code-inner js-file-line">			} <span class="pl-k">else</span> {</td>
+      </tr>
+      <tr>
+        <td id="L925" class="blob-num js-line-number" data-line-number="925"></td>
+        <td id="LC925" class="blob-code blob-code-inner js-file-line">				<span class="pl-k">if</span> (policy-&gt;cur &lt; policy-&gt;max)</td>
+      </tr>
+      <tr>
+        <td id="L926" class="blob-num js-line-number" data-line-number="926"></td>
+        <td id="LC926" class="blob-code blob-code-inner js-file-line">					this_dbs_info-&gt;rate_mult =</td>
+      </tr>
+      <tr>
+        <td id="L927" class="blob-num js-line-number" data-line-number="927"></td>
+        <td id="LC927" class="blob-code blob-code-inner js-file-line">						dbs_tuners_ins.<span class="pl-smi">sampling_down_factor</span>;</td>
+      </tr>
+      <tr>
+        <td id="L928" class="blob-num js-line-number" data-line-number="928"></td>
+        <td id="LC928" class="blob-code blob-code-inner js-file-line">				<span class="pl-c1">dbs_freq_increase</span>(policy, policy-&gt;max);</td>
+      </tr>
+      <tr>
+        <td id="L929" class="blob-num js-line-number" data-line-number="929"></td>
+        <td id="LC929" class="blob-code blob-code-inner js-file-line">			}</td>
+      </tr>
+      <tr>
+        <td id="L930" class="blob-num js-line-number" data-line-number="930"></td>
+        <td id="LC930" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L931" class="blob-num js-line-number" data-line-number="931"></td>
+        <td id="LC931" class="blob-code blob-code-inner js-file-line">			<span class="pl-k">for</span> (i = (SUP_MAX_STEP - <span class="pl-c1">1</span>); i &gt; <span class="pl-c1">0</span>; i--) {</td>
+      </tr>
+      <tr>
+        <td id="L932" class="blob-num js-line-number" data-line-number="932"></td>
+        <td id="LC932" class="blob-code blob-code-inner js-file-line">				<span class="pl-k">if</span> (max_load_freq &gt; SUP_THRESHOLD_STEPS[i]</td>
+      </tr>
+      <tr>
+        <td id="L933" class="blob-num js-line-number" data-line-number="933"></td>
+        <td id="LC933" class="blob-code blob-code-inner js-file-line">							* policy-&gt;cur) {</td>
+      </tr>
+      <tr>
+        <td id="L934" class="blob-num js-line-number" data-line-number="934"></td>
+        <td id="LC934" class="blob-code blob-code-inner js-file-line">					smart_up_inc = (policy-&gt;max - policy-&gt;cur)</td>
+      </tr>
+      <tr>
+        <td id="L935" class="blob-num js-line-number" data-line-number="935"></td>
+        <td id="LC935" class="blob-code blob-code-inner js-file-line">							/ SUP_FREQ_STEPS[i];</td>
+      </tr>
+      <tr>
+        <td id="L936" class="blob-num js-line-number" data-line-number="936"></td>
+        <td id="LC936" class="blob-code blob-code-inner js-file-line">					<span class="pl-k">break</span>;</td>
+      </tr>
+      <tr>
+        <td id="L937" class="blob-num js-line-number" data-line-number="937"></td>
+        <td id="LC937" class="blob-code blob-code-inner js-file-line">				}</td>
+      </tr>
+      <tr>
+        <td id="L938" class="blob-num js-line-number" data-line-number="938"></td>
+        <td id="LC938" class="blob-code blob-code-inner js-file-line">			}</td>
+      </tr>
+      <tr>
+        <td id="L939" class="blob-num js-line-number" data-line-number="939"></td>
+        <td id="LC939" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L940" class="blob-num js-line-number" data-line-number="940"></td>
+        <td id="LC940" class="blob-code blob-code-inner js-file-line">			<span class="pl-c">/* 20130429 UPDATE */</span></td>
+      </tr>
+      <tr>
+        <td id="L941" class="blob-num js-line-number" data-line-number="941"></td>
+        <td id="LC941" class="blob-code blob-code-inner js-file-line">			check_idx =  pre_freq_idx[core_j].<span class="pl-smi">freq_idx</span>;</td>
+      </tr>
+      <tr>
+        <td id="L942" class="blob-num js-line-number" data-line-number="942"></td>
+        <td id="LC942" class="blob-code blob-code-inner js-file-line">			check_freq = pre_freq_idx[core_j].<span class="pl-smi">freq_value</span>;</td>
+      </tr>
+      <tr>
+        <td id="L943" class="blob-num js-line-number" data-line-number="943"></td>
+        <td id="LC943" class="blob-code blob-code-inner js-file-line">			<span class="pl-k">if</span> (( check_idx == <span class="pl-c1">0</span>)</td>
+      </tr>
+      <tr>
+        <td id="L944" class="blob-num js-line-number" data-line-number="944"></td>
+        <td id="LC944" class="blob-code blob-code-inner js-file-line">					|| (this_dbs_info-&gt;freq_table[check_idx].<span class="pl-smi">frequency</span></td>
+      </tr>
+      <tr>
+        <td id="L945" class="blob-num js-line-number" data-line-number="945"></td>
+        <td id="LC945" class="blob-code blob-code-inner js-file-line">					!=  policy-&gt;cur)) {</td>
+      </tr>
+      <tr>
+        <td id="L946" class="blob-num js-line-number" data-line-number="946"></td>
+        <td id="LC946" class="blob-code blob-code-inner js-file-line">				<span class="pl-k">int</span> i = <span class="pl-c1">0</span>;</td>
+      </tr>
+      <tr>
+        <td id="L947" class="blob-num js-line-number" data-line-number="947"></td>
+        <td id="LC947" class="blob-code blob-code-inner js-file-line">				<span class="pl-k">for</span> (i =<span class="pl-c1">0</span>; i &lt; SUP_FREQ_LEVEL; i ++) {</td>
+      </tr>
+      <tr>
+        <td id="L948" class="blob-num js-line-number" data-line-number="948"></td>
+        <td id="LC948" class="blob-code blob-code-inner js-file-line">					<span class="pl-k">if</span> (this_dbs_info-&gt;freq_table[i].<span class="pl-smi">frequency</span> == policy-&gt;cur) {</td>
+      </tr>
+      <tr>
+        <td id="L949" class="blob-num js-line-number" data-line-number="949"></td>
+        <td id="LC949" class="blob-code blob-code-inner js-file-line">						pre_freq_idx[core_j].<span class="pl-smi">freq_idx</span> = i;</td>
+      </tr>
+      <tr>
+        <td id="L950" class="blob-num js-line-number" data-line-number="950"></td>
+        <td id="LC950" class="blob-code blob-code-inner js-file-line">						pre_freq_idx[core_j].<span class="pl-smi">freq_value</span> = policy-&gt;cur;</td>
+      </tr>
+      <tr>
+        <td id="L951" class="blob-num js-line-number" data-line-number="951"></td>
+        <td id="LC951" class="blob-code blob-code-inner js-file-line">						check_idx =  i;</td>
+      </tr>
+      <tr>
+        <td id="L952" class="blob-num js-line-number" data-line-number="952"></td>
+        <td id="LC952" class="blob-code blob-code-inner js-file-line">						check_freq = policy-&gt;cur;</td>
+      </tr>
+      <tr>
+        <td id="L953" class="blob-num js-line-number" data-line-number="953"></td>
+        <td id="LC953" class="blob-code blob-code-inner js-file-line">						<span class="pl-k">break</span>;</td>
+      </tr>
+      <tr>
+        <td id="L954" class="blob-num js-line-number" data-line-number="954"></td>
+        <td id="LC954" class="blob-code blob-code-inner js-file-line">					}</td>
+      </tr>
+      <tr>
+        <td id="L955" class="blob-num js-line-number" data-line-number="955"></td>
+        <td id="LC955" class="blob-code blob-code-inner js-file-line">				}</td>
+      </tr>
+      <tr>
+        <td id="L956" class="blob-num js-line-number" data-line-number="956"></td>
+        <td id="LC956" class="blob-code blob-code-inner js-file-line">			}</td>
+      </tr>
+      <tr>
+        <td id="L957" class="blob-num js-line-number" data-line-number="957"></td>
+        <td id="LC957" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L958" class="blob-num js-line-number" data-line-number="958"></td>
+        <td id="LC958" class="blob-code blob-code-inner js-file-line">			<span class="pl-k">if</span> (check_idx &lt; SUP_FREQ_LEVEL-<span class="pl-c1">1</span>) {</td>
+      </tr>
+      <tr>
+        <td id="L959" class="blob-num js-line-number" data-line-number="959"></td>
+        <td id="LC959" class="blob-code blob-code-inner js-file-line">				temp_up_inc =</td>
+      </tr>
+      <tr>
+        <td id="L960" class="blob-num js-line-number" data-line-number="960"></td>
+        <td id="LC960" class="blob-code blob-code-inner js-file-line">					this_dbs_info-&gt;freq_table[check_idx + <span class="pl-c1">1</span>].<span class="pl-smi">frequency</span></td>
+      </tr>
+      <tr>
+        <td id="L961" class="blob-num js-line-number" data-line-number="961"></td>
+        <td id="LC961" class="blob-code blob-code-inner js-file-line">					- check_freq;</td>
+      </tr>
+      <tr>
+        <td id="L962" class="blob-num js-line-number" data-line-number="962"></td>
+        <td id="LC962" class="blob-code blob-code-inner js-file-line">			}</td>
+      </tr>
+      <tr>
+        <td id="L963" class="blob-num js-line-number" data-line-number="963"></td>
+        <td id="LC963" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L964" class="blob-num js-line-number" data-line-number="964"></td>
+        <td id="LC964" class="blob-code blob-code-inner js-file-line">			<span class="pl-k">if</span> (smart_up_inc &lt; temp_up_inc )</td>
+      </tr>
+      <tr>
+        <td id="L965" class="blob-num js-line-number" data-line-number="965"></td>
+        <td id="LC965" class="blob-code blob-code-inner js-file-line">				smart_up_inc = temp_up_inc;</td>
+      </tr>
+      <tr>
+        <td id="L966" class="blob-num js-line-number" data-line-number="966"></td>
+        <td id="LC966" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L967" class="blob-num js-line-number" data-line-number="967"></td>
+        <td id="LC967" class="blob-code blob-code-inner js-file-line">			freq_next = <span class="pl-c1">MIN</span>((policy-&gt;cur + smart_up_inc), policy-&gt;max);</td>
+      </tr>
+      <tr>
+        <td id="L968" class="blob-num js-line-number" data-line-number="968"></td>
+        <td id="LC968" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L969" class="blob-num js-line-number" data-line-number="969"></td>
+        <td id="LC969" class="blob-code blob-code-inner js-file-line">			<span class="pl-k">if</span> (policy-&gt;cur &gt;= dbs_tuners_ins.<span class="pl-smi">smart_high_slow_up_freq</span>) {</td>
+      </tr>
+      <tr>
+        <td id="L970" class="blob-num js-line-number" data-line-number="970"></td>
+        <td id="LC970" class="blob-code blob-code-inner js-file-line">				<span class="pl-k">int</span> idx = hist_load_high[core_j].<span class="pl-smi">hist_load_cnt</span>;</td>
+      </tr>
+      <tr>
+        <td id="L971" class="blob-num js-line-number" data-line-number="971"></td>
+        <td id="LC971" class="blob-code blob-code-inner js-file-line">				<span class="pl-k">int</span> avg_hist_load = <span class="pl-c1">0</span>;</td>
+      </tr>
+      <tr>
+        <td id="L972" class="blob-num js-line-number" data-line-number="972"></td>
+        <td id="LC972" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L973" class="blob-num js-line-number" data-line-number="973"></td>
+        <td id="LC973" class="blob-code blob-code-inner js-file-line">				<span class="pl-k">if</span> (idx &gt;= dbs_tuners_ins.<span class="pl-smi">smart_high_slow_up_dur</span>)</td>
+      </tr>
+      <tr>
+        <td id="L974" class="blob-num js-line-number" data-line-number="974"></td>
+        <td id="LC974" class="blob-code blob-code-inner js-file-line">					idx = <span class="pl-c1">0</span>;</td>
+      </tr>
+      <tr>
+        <td id="L975" class="blob-num js-line-number" data-line-number="975"></td>
+        <td id="LC975" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L976" class="blob-num js-line-number" data-line-number="976"></td>
+        <td id="LC976" class="blob-code blob-code-inner js-file-line">				hist_load_high[core_j].<span class="pl-smi">hist_max_load</span>[idx] = max_load;</td>
+      </tr>
+      <tr>
+        <td id="L977" class="blob-num js-line-number" data-line-number="977"></td>
+        <td id="LC977" class="blob-code blob-code-inner js-file-line">				hist_load_high[core_j].<span class="pl-smi">hist_load_cnt</span> = idx + <span class="pl-c1">1</span>;</td>
+      </tr>
+      <tr>
+        <td id="L978" class="blob-num js-line-number" data-line-number="978"></td>
+        <td id="LC978" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L979" class="blob-num js-line-number" data-line-number="979"></td>
+        <td id="LC979" class="blob-code blob-code-inner js-file-line">				<span class="pl-c">/* note : check history_load and get_sum_hist_load */</span></td>
+      </tr>
+      <tr>
+        <td id="L980" class="blob-num js-line-number" data-line-number="980"></td>
+        <td id="LC980" class="blob-code blob-code-inner js-file-line">				<span class="pl-k">if</span> (hist_load_high[core_j].</td>
+      </tr>
+      <tr>
+        <td id="L981" class="blob-num js-line-number" data-line-number="981"></td>
+        <td id="LC981" class="blob-code blob-code-inner js-file-line">						hist_max_load[dbs_tuners_ins.<span class="pl-smi">smart_high_slow_up_dur</span> - <span class="pl-c1">1</span>] &gt; <span class="pl-c1">0</span>) {</td>
+      </tr>
+      <tr>
+        <td id="L982" class="blob-num js-line-number" data-line-number="982"></td>
+        <td id="LC982" class="blob-code blob-code-inner js-file-line">					<span class="pl-k">int</span> sum_hist_load_freq = <span class="pl-c1">0</span>;</td>
+      </tr>
+      <tr>
+        <td id="L983" class="blob-num js-line-number" data-line-number="983"></td>
+        <td id="LC983" class="blob-code blob-code-inner js-file-line">					<span class="pl-k">int</span> i = <span class="pl-c1">0</span>;</td>
+      </tr>
+      <tr>
+        <td id="L984" class="blob-num js-line-number" data-line-number="984"></td>
+        <td id="LC984" class="blob-code blob-code-inner js-file-line">					<span class="pl-k">for</span> (i = <span class="pl-c1">0</span>; i &lt; dbs_tuners_ins.<span class="pl-smi">smart_high_slow_up_dur</span>; i++)</td>
+      </tr>
+      <tr>
+        <td id="L985" class="blob-num js-line-number" data-line-number="985"></td>
+        <td id="LC985" class="blob-code blob-code-inner js-file-line">						sum_hist_load_freq +=</td>
+      </tr>
+      <tr>
+        <td id="L986" class="blob-num js-line-number" data-line-number="986"></td>
+        <td id="LC986" class="blob-code blob-code-inner js-file-line">							hist_load_high[core_j].<span class="pl-smi">hist_max_load</span>[i];</td>
+      </tr>
+      <tr>
+        <td id="L987" class="blob-num js-line-number" data-line-number="987"></td>
+        <td id="LC987" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L988" class="blob-num js-line-number" data-line-number="988"></td>
+        <td id="LC988" class="blob-code blob-code-inner js-file-line">					avg_hist_load = sum_hist_load_freq</td>
+      </tr>
+      <tr>
+        <td id="L989" class="blob-num js-line-number" data-line-number="989"></td>
+        <td id="LC989" class="blob-code blob-code-inner js-file-line">								/ dbs_tuners_ins.<span class="pl-smi">smart_high_slow_up_dur</span>;</td>
+      </tr>
+      <tr>
+        <td id="L990" class="blob-num js-line-number" data-line-number="990"></td>
+        <td id="LC990" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L991" class="blob-num js-line-number" data-line-number="991"></td>
+        <td id="LC991" class="blob-code blob-code-inner js-file-line">					<span class="pl-k">if</span> (avg_hist_load &gt; dbs_tuners_ins.<span class="pl-smi">smart_slow_up_load</span>) {</td>
+      </tr>
+      <tr>
+        <td id="L992" class="blob-num js-line-number" data-line-number="992"></td>
+        <td id="LC992" class="blob-code blob-code-inner js-file-line">						<span class="pl-c1">reset_hist_high</span>(&amp;hist_load_high[core_j]);</td>
+      </tr>
+      <tr>
+        <td id="L993" class="blob-num js-line-number" data-line-number="993"></td>
+        <td id="LC993" class="blob-code blob-code-inner js-file-line">						freq_next = <span class="pl-c1">MIN</span>((policy-&gt;cur + temp_up_inc), policy-&gt;max);</td>
+      </tr>
+      <tr>
+        <td id="L994" class="blob-num js-line-number" data-line-number="994"></td>
+        <td id="LC994" class="blob-code blob-code-inner js-file-line">					} <span class="pl-k">else</span></td>
+      </tr>
+      <tr>
+        <td id="L995" class="blob-num js-line-number" data-line-number="995"></td>
+        <td id="LC995" class="blob-code blob-code-inner js-file-line">						freq_next = policy-&gt;cur;</td>
+      </tr>
+      <tr>
+        <td id="L996" class="blob-num js-line-number" data-line-number="996"></td>
+        <td id="LC996" class="blob-code blob-code-inner js-file-line">				} <span class="pl-k">else</span> {</td>
+      </tr>
+      <tr>
+        <td id="L997" class="blob-num js-line-number" data-line-number="997"></td>
+        <td id="LC997" class="blob-code blob-code-inner js-file-line">					freq_next = policy-&gt;cur;</td>
+      </tr>
+      <tr>
+        <td id="L998" class="blob-num js-line-number" data-line-number="998"></td>
+        <td id="LC998" class="blob-code blob-code-inner js-file-line">				}</td>
+      </tr>
+      <tr>
+        <td id="L999" class="blob-num js-line-number" data-line-number="999"></td>
+        <td id="LC999" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L1000" class="blob-num js-line-number" data-line-number="1000"></td>
+        <td id="LC1000" class="blob-code blob-code-inner js-file-line">			} <span class="pl-k">else</span> <span class="pl-k">if</span> (policy-&gt;cur &gt;= dbs_tuners_ins.<span class="pl-smi">smart_slow_up_freq</span> ) {</td>
+      </tr>
+      <tr>
+        <td id="L1001" class="blob-num js-line-number" data-line-number="1001"></td>
+        <td id="LC1001" class="blob-code blob-code-inner js-file-line">				<span class="pl-k">int</span> idx = hist_load[core_j].<span class="pl-smi">hist_load_cnt</span>;</td>
+      </tr>
+      <tr>
+        <td id="L1002" class="blob-num js-line-number" data-line-number="1002"></td>
+        <td id="LC1002" class="blob-code blob-code-inner js-file-line">				<span class="pl-k">int</span> avg_hist_load = <span class="pl-c1">0</span>;</td>
+      </tr>
+      <tr>
+        <td id="L1003" class="blob-num js-line-number" data-line-number="1003"></td>
+        <td id="LC1003" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L1004" class="blob-num js-line-number" data-line-number="1004"></td>
+        <td id="LC1004" class="blob-code blob-code-inner js-file-line">				<span class="pl-k">if</span> (idx &gt;= dbs_tuners_ins.<span class="pl-smi">smart_slow_up_dur</span>)</td>
+      </tr>
+      <tr>
+        <td id="L1005" class="blob-num js-line-number" data-line-number="1005"></td>
+        <td id="LC1005" class="blob-code blob-code-inner js-file-line">					idx = <span class="pl-c1">0</span>;</td>
+      </tr>
+      <tr>
+        <td id="L1006" class="blob-num js-line-number" data-line-number="1006"></td>
+        <td id="LC1006" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L1007" class="blob-num js-line-number" data-line-number="1007"></td>
+        <td id="LC1007" class="blob-code blob-code-inner js-file-line">				hist_load[core_j].<span class="pl-smi">hist_max_load</span>[idx] = max_load;</td>
+      </tr>
+      <tr>
+        <td id="L1008" class="blob-num js-line-number" data-line-number="1008"></td>
+        <td id="LC1008" class="blob-code blob-code-inner js-file-line">				hist_load[core_j].<span class="pl-smi">hist_load_cnt</span> = idx + <span class="pl-c1">1</span>;</td>
+      </tr>
+      <tr>
+        <td id="L1009" class="blob-num js-line-number" data-line-number="1009"></td>
+        <td id="LC1009" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L1010" class="blob-num js-line-number" data-line-number="1010"></td>
+        <td id="LC1010" class="blob-code blob-code-inner js-file-line">				<span class="pl-c">/* note : check history_load and get_sum_hist_load */</span></td>
+      </tr>
+      <tr>
+        <td id="L1011" class="blob-num js-line-number" data-line-number="1011"></td>
+        <td id="LC1011" class="blob-code blob-code-inner js-file-line">				<span class="pl-k">if</span> (hist_load[core_j].</td>
+      </tr>
+      <tr>
+        <td id="L1012" class="blob-num js-line-number" data-line-number="1012"></td>
+        <td id="LC1012" class="blob-code blob-code-inner js-file-line">					hist_max_load[dbs_tuners_ins.<span class="pl-smi">smart_slow_up_dur</span> - <span class="pl-c1">1</span>] &gt; <span class="pl-c1">0</span>) {</td>
+      </tr>
+      <tr>
+        <td id="L1013" class="blob-num js-line-number" data-line-number="1013"></td>
+        <td id="LC1013" class="blob-code blob-code-inner js-file-line">					<span class="pl-k">int</span> sum_hist_load_freq = <span class="pl-c1">0</span>;</td>
+      </tr>
+      <tr>
+        <td id="L1014" class="blob-num js-line-number" data-line-number="1014"></td>
+        <td id="LC1014" class="blob-code blob-code-inner js-file-line">					<span class="pl-k">int</span> i = <span class="pl-c1">0</span>;</td>
+      </tr>
+      <tr>
+        <td id="L1015" class="blob-num js-line-number" data-line-number="1015"></td>
+        <td id="LC1015" class="blob-code blob-code-inner js-file-line">					<span class="pl-k">for</span> (i = <span class="pl-c1">0</span>; i &lt; dbs_tuners_ins.<span class="pl-smi">smart_slow_up_dur</span>; i++)</td>
+      </tr>
+      <tr>
+        <td id="L1016" class="blob-num js-line-number" data-line-number="1016"></td>
+        <td id="LC1016" class="blob-code blob-code-inner js-file-line">						sum_hist_load_freq +=</td>
+      </tr>
+      <tr>
+        <td id="L1017" class="blob-num js-line-number" data-line-number="1017"></td>
+        <td id="LC1017" class="blob-code blob-code-inner js-file-line">							hist_load[core_j].<span class="pl-smi">hist_max_load</span>[i];</td>
+      </tr>
+      <tr>
+        <td id="L1018" class="blob-num js-line-number" data-line-number="1018"></td>
+        <td id="LC1018" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L1019" class="blob-num js-line-number" data-line-number="1019"></td>
+        <td id="LC1019" class="blob-code blob-code-inner js-file-line">					avg_hist_load = sum_hist_load_freq</td>
+      </tr>
+      <tr>
+        <td id="L1020" class="blob-num js-line-number" data-line-number="1020"></td>
+        <td id="LC1020" class="blob-code blob-code-inner js-file-line">							/ dbs_tuners_ins.<span class="pl-smi">smart_slow_up_dur</span>;</td>
+      </tr>
+      <tr>
+        <td id="L1021" class="blob-num js-line-number" data-line-number="1021"></td>
+        <td id="LC1021" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L1022" class="blob-num js-line-number" data-line-number="1022"></td>
+        <td id="LC1022" class="blob-code blob-code-inner js-file-line">					<span class="pl-k">if</span> (avg_hist_load &gt; dbs_tuners_ins.<span class="pl-smi">smart_slow_up_load</span>) {</td>
+      </tr>
+      <tr>
+        <td id="L1023" class="blob-num js-line-number" data-line-number="1023"></td>
+        <td id="LC1023" class="blob-code blob-code-inner js-file-line">						<span class="pl-c1">reset_hist</span>(&amp;hist_load[core_j]);</td>
+      </tr>
+      <tr>
+        <td id="L1024" class="blob-num js-line-number" data-line-number="1024"></td>
+        <td id="LC1024" class="blob-code blob-code-inner js-file-line">						freq_next = <span class="pl-c1">MIN</span>((policy-&gt;cur + temp_up_inc), policy-&gt;max);</td>
+      </tr>
+      <tr>
+        <td id="L1025" class="blob-num js-line-number" data-line-number="1025"></td>
+        <td id="LC1025" class="blob-code blob-code-inner js-file-line">					} <span class="pl-k">else</span></td>
+      </tr>
+      <tr>
+        <td id="L1026" class="blob-num js-line-number" data-line-number="1026"></td>
+        <td id="LC1026" class="blob-code blob-code-inner js-file-line">						freq_next = policy-&gt;cur;</td>
+      </tr>
+      <tr>
+        <td id="L1027" class="blob-num js-line-number" data-line-number="1027"></td>
+        <td id="LC1027" class="blob-code blob-code-inner js-file-line">				} <span class="pl-k">else</span> {</td>
+      </tr>
+      <tr>
+        <td id="L1028" class="blob-num js-line-number" data-line-number="1028"></td>
+        <td id="LC1028" class="blob-code blob-code-inner js-file-line">					freq_next = policy-&gt;cur;</td>
+      </tr>
+      <tr>
+        <td id="L1029" class="blob-num js-line-number" data-line-number="1029"></td>
+        <td id="LC1029" class="blob-code blob-code-inner js-file-line">				}</td>
+      </tr>
+      <tr>
+        <td id="L1030" class="blob-num js-line-number" data-line-number="1030"></td>
+        <td id="LC1030" class="blob-code blob-code-inner js-file-line">			} <span class="pl-k">else</span> {</td>
+      </tr>
+      <tr>
+        <td id="L1031" class="blob-num js-line-number" data-line-number="1031"></td>
+        <td id="LC1031" class="blob-code blob-code-inner js-file-line">				<span class="pl-c1">reset_hist</span>(&amp;hist_load[core_j]);</td>
+      </tr>
+      <tr>
+        <td id="L1032" class="blob-num js-line-number" data-line-number="1032"></td>
+        <td id="LC1032" class="blob-code blob-code-inner js-file-line">			}</td>
+      </tr>
+      <tr>
+        <td id="L1033" class="blob-num js-line-number" data-line-number="1033"></td>
+        <td id="LC1033" class="blob-code blob-code-inner js-file-line">			<span class="pl-k">if</span> (freq_next == policy-&gt;max)</td>
+      </tr>
+      <tr>
+        <td id="L1034" class="blob-num js-line-number" data-line-number="1034"></td>
+        <td id="LC1034" class="blob-code blob-code-inner js-file-line">				this_dbs_info-&gt;rate_mult =</td>
+      </tr>
+      <tr>
+        <td id="L1035" class="blob-num js-line-number" data-line-number="1035"></td>
+        <td id="LC1035" class="blob-code blob-code-inner js-file-line">					dbs_tuners_ins.<span class="pl-smi">sampling_down_factor</span>;</td>
+      </tr>
+      <tr>
+        <td id="L1036" class="blob-num js-line-number" data-line-number="1036"></td>
+        <td id="LC1036" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L1037" class="blob-num js-line-number" data-line-number="1037"></td>
+        <td id="LC1037" class="blob-code blob-code-inner js-file-line">			<span class="pl-c1">dbs_freq_increase</span>(policy, freq_next);</td>
+      </tr>
+      <tr>
+        <td id="L1038" class="blob-num js-line-number" data-line-number="1038"></td>
+        <td id="LC1038" class="blob-code blob-code-inner js-file-line">			<span class="pl-k">return</span>;</td>
+      </tr>
+      <tr>
+        <td id="L1039" class="blob-num js-line-number" data-line-number="1039"></td>
+        <td id="LC1039" class="blob-code blob-code-inner js-file-line">		}</td>
+      </tr>
+      <tr>
+        <td id="L1040" class="blob-num js-line-number" data-line-number="1040"></td>
+        <td id="LC1040" class="blob-code blob-code-inner js-file-line">	} <span class="pl-k">else</span> {</td>
+      </tr>
+      <tr>
+        <td id="L1041" class="blob-num js-line-number" data-line-number="1041"></td>
+        <td id="LC1041" class="blob-code blob-code-inner js-file-line">		<span class="pl-c">/* Check for frequency increase */</span></td>
+      </tr>
+      <tr>
+        <td id="L1042" class="blob-num js-line-number" data-line-number="1042"></td>
+        <td id="LC1042" class="blob-code blob-code-inner js-file-line">		<span class="pl-k">if</span> (max_load_freq &gt; dbs_tuners_ins.<span class="pl-smi">up_threshold</span> * policy-&gt;cur) {</td>
+      </tr>
+      <tr>
+        <td id="L1043" class="blob-num js-line-number" data-line-number="1043"></td>
+        <td id="LC1043" class="blob-code blob-code-inner js-file-line">			<span class="pl-k">int</span> target;</td>
+      </tr>
+      <tr>
+        <td id="L1044" class="blob-num js-line-number" data-line-number="1044"></td>
+        <td id="LC1044" class="blob-code blob-code-inner js-file-line">			<span class="pl-k">int</span> inc;</td>
+      </tr>
+      <tr>
+        <td id="L1045" class="blob-num js-line-number" data-line-number="1045"></td>
+        <td id="LC1045" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L1046" class="blob-num js-line-number" data-line-number="1046"></td>
+        <td id="LC1046" class="blob-code blob-code-inner js-file-line">			<span class="pl-k">if</span> (policy-&gt;cur &lt; dbs_tuners_ins.<span class="pl-smi">step_up_early_hispeed</span>) {</td>
+      </tr>
+      <tr>
+        <td id="L1047" class="blob-num js-line-number" data-line-number="1047"></td>
+        <td id="LC1047" class="blob-code blob-code-inner js-file-line">				target = dbs_tuners_ins.<span class="pl-smi">step_up_early_hispeed</span>;</td>
+      </tr>
+      <tr>
+        <td id="L1048" class="blob-num js-line-number" data-line-number="1048"></td>
+        <td id="LC1048" class="blob-code blob-code-inner js-file-line">			} <span class="pl-k">else</span> <span class="pl-k">if</span> (policy-&gt;cur &lt; dbs_tuners_ins.<span class="pl-smi">step_up_interim_hispeed</span>) {</td>
+      </tr>
+      <tr>
+        <td id="L1049" class="blob-num js-line-number" data-line-number="1049"></td>
+        <td id="LC1049" class="blob-code blob-code-inner js-file-line">				<span class="pl-k">if</span> (policy-&gt;cur == dbs_tuners_ins.<span class="pl-smi">step_up_early_hispeed</span>) {</td>
+      </tr>
+      <tr>
+        <td id="L1050" class="blob-num js-line-number" data-line-number="1050"></td>
+        <td id="LC1050" class="blob-code blob-code-inner js-file-line">					<span class="pl-k">if</span> (this_dbs_info-&gt;freq_stay_count &lt;</td>
+      </tr>
+      <tr>
+        <td id="L1051" class="blob-num js-line-number" data-line-number="1051"></td>
+        <td id="LC1051" class="blob-code blob-code-inner js-file-line">						dbs_tuners_ins.<span class="pl-smi">sampling_early_factor</span>) {</td>
+      </tr>
+      <tr>
+        <td id="L1052" class="blob-num js-line-number" data-line-number="1052"></td>
+        <td id="LC1052" class="blob-code blob-code-inner js-file-line">						this_dbs_info-&gt;freq_stay_count++;</td>
+      </tr>
+      <tr>
+        <td id="L1053" class="blob-num js-line-number" data-line-number="1053"></td>
+        <td id="LC1053" class="blob-code blob-code-inner js-file-line">						<span class="pl-k">return</span>;</td>
+      </tr>
+      <tr>
+        <td id="L1054" class="blob-num js-line-number" data-line-number="1054"></td>
+        <td id="LC1054" class="blob-code blob-code-inner js-file-line">					}</td>
+      </tr>
+      <tr>
+        <td id="L1055" class="blob-num js-line-number" data-line-number="1055"></td>
+        <td id="LC1055" class="blob-code blob-code-inner js-file-line">				}</td>
+      </tr>
+      <tr>
+        <td id="L1056" class="blob-num js-line-number" data-line-number="1056"></td>
+        <td id="LC1056" class="blob-code blob-code-inner js-file-line">				this_dbs_info-&gt;freq_stay_count = <span class="pl-c1">1</span>;</td>
+      </tr>
+      <tr>
+        <td id="L1057" class="blob-num js-line-number" data-line-number="1057"></td>
+        <td id="LC1057" class="blob-code blob-code-inner js-file-line">				inc = (policy-&gt;max * dbs_tuners_ins.<span class="pl-smi">freq_step</span>) / <span class="pl-c1">100</span>;</td>
+      </tr>
+      <tr>
+        <td id="L1058" class="blob-num js-line-number" data-line-number="1058"></td>
+        <td id="LC1058" class="blob-code blob-code-inner js-file-line">				target = <span class="pl-c1">min</span>(dbs_tuners_ins.<span class="pl-smi">step_up_interim_hispeed</span>,</td>
+      </tr>
+      <tr>
+        <td id="L1059" class="blob-num js-line-number" data-line-number="1059"></td>
+        <td id="LC1059" class="blob-code blob-code-inner js-file-line">					policy-&gt;cur + inc);</td>
+      </tr>
+      <tr>
+        <td id="L1060" class="blob-num js-line-number" data-line-number="1060"></td>
+        <td id="LC1060" class="blob-code blob-code-inner js-file-line">			} <span class="pl-k">else</span> {</td>
+      </tr>
+      <tr>
+        <td id="L1061" class="blob-num js-line-number" data-line-number="1061"></td>
+        <td id="LC1061" class="blob-code blob-code-inner js-file-line">				<span class="pl-k">if</span> (policy-&gt;cur == dbs_tuners_ins.<span class="pl-smi">step_up_interim_hispeed</span>) {</td>
+      </tr>
+      <tr>
+        <td id="L1062" class="blob-num js-line-number" data-line-number="1062"></td>
+        <td id="LC1062" class="blob-code blob-code-inner js-file-line">					<span class="pl-k">if</span> (this_dbs_info-&gt;freq_stay_count &lt;</td>
+      </tr>
+      <tr>
+        <td id="L1063" class="blob-num js-line-number" data-line-number="1063"></td>
+        <td id="LC1063" class="blob-code blob-code-inner js-file-line">						dbs_tuners_ins.<span class="pl-smi">sampling_interim_factor</span>) {</td>
+      </tr>
+      <tr>
+        <td id="L1064" class="blob-num js-line-number" data-line-number="1064"></td>
+        <td id="LC1064" class="blob-code blob-code-inner js-file-line">						this_dbs_info-&gt;freq_stay_count++;</td>
+      </tr>
+      <tr>
+        <td id="L1065" class="blob-num js-line-number" data-line-number="1065"></td>
+        <td id="LC1065" class="blob-code blob-code-inner js-file-line">						<span class="pl-k">return</span>;</td>
+      </tr>
+      <tr>
+        <td id="L1066" class="blob-num js-line-number" data-line-number="1066"></td>
+        <td id="LC1066" class="blob-code blob-code-inner js-file-line">					}</td>
+      </tr>
+      <tr>
+        <td id="L1067" class="blob-num js-line-number" data-line-number="1067"></td>
+        <td id="LC1067" class="blob-code blob-code-inner js-file-line">				}</td>
+      </tr>
+      <tr>
+        <td id="L1068" class="blob-num js-line-number" data-line-number="1068"></td>
+        <td id="LC1068" class="blob-code blob-code-inner js-file-line">				this_dbs_info-&gt;freq_stay_count = <span class="pl-c1">1</span>;</td>
+      </tr>
+      <tr>
+        <td id="L1069" class="blob-num js-line-number" data-line-number="1069"></td>
+        <td id="LC1069" class="blob-code blob-code-inner js-file-line">				target = policy-&gt;max;</td>
+      </tr>
+      <tr>
+        <td id="L1070" class="blob-num js-line-number" data-line-number="1070"></td>
+        <td id="LC1070" class="blob-code blob-code-inner js-file-line">			}</td>
+      </tr>
+      <tr>
+        <td id="L1071" class="blob-num js-line-number" data-line-number="1071"></td>
+        <td id="LC1071" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L1072" class="blob-num js-line-number" data-line-number="1072"></td>
+        <td id="LC1072" class="blob-code blob-code-inner js-file-line">			<span class="pl-c1">pr_debug</span>(<span class="pl-s"><span class="pl-pds">&quot;</span><span class="pl-c1">%s</span>: cpu=<span class="pl-c1">%d</span>, cur=<span class="pl-c1">%d</span>, target=<span class="pl-c1">%d</span><span class="pl-cce">\n</span><span class="pl-pds">&quot;</span></span>,</td>
+      </tr>
+      <tr>
+        <td id="L1073" class="blob-num js-line-number" data-line-number="1073"></td>
+        <td id="LC1073" class="blob-code blob-code-inner js-file-line">				__func__, policy-&gt;cpu, policy-&gt;cur, target);</td>
+      </tr>
+      <tr>
+        <td id="L1074" class="blob-num js-line-number" data-line-number="1074"></td>
+        <td id="LC1074" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L1075" class="blob-num js-line-number" data-line-number="1075"></td>
+        <td id="LC1075" class="blob-code blob-code-inner js-file-line">			<span class="pl-c">/* If switching to max speed, apply sampling_down_factor */</span></td>
+      </tr>
+      <tr>
+        <td id="L1076" class="blob-num js-line-number" data-line-number="1076"></td>
+        <td id="LC1076" class="blob-code blob-code-inner js-file-line">			<span class="pl-k">if</span> (target == policy-&gt;max)</td>
+      </tr>
+      <tr>
+        <td id="L1077" class="blob-num js-line-number" data-line-number="1077"></td>
+        <td id="LC1077" class="blob-code blob-code-inner js-file-line">				this_dbs_info-&gt;rate_mult =</td>
+      </tr>
+      <tr>
+        <td id="L1078" class="blob-num js-line-number" data-line-number="1078"></td>
+        <td id="LC1078" class="blob-code blob-code-inner js-file-line">					dbs_tuners_ins.<span class="pl-smi">sampling_down_factor</span>;</td>
+      </tr>
+      <tr>
+        <td id="L1079" class="blob-num js-line-number" data-line-number="1079"></td>
+        <td id="LC1079" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L1080" class="blob-num js-line-number" data-line-number="1080"></td>
+        <td id="LC1080" class="blob-code blob-code-inner js-file-line">			<span class="pl-c1">dbs_freq_increase</span>(policy, target);</td>
+      </tr>
+      <tr>
+        <td id="L1081" class="blob-num js-line-number" data-line-number="1081"></td>
+        <td id="LC1081" class="blob-code blob-code-inner js-file-line">			<span class="pl-k">return</span>;</td>
+      </tr>
+      <tr>
+        <td id="L1082" class="blob-num js-line-number" data-line-number="1082"></td>
+        <td id="LC1082" class="blob-code blob-code-inner js-file-line">		}</td>
+      </tr>
+      <tr>
+        <td id="L1083" class="blob-num js-line-number" data-line-number="1083"></td>
+        <td id="LC1083" class="blob-code blob-code-inner js-file-line">	}</td>
+      </tr>
+      <tr>
+        <td id="L1084" class="blob-num js-line-number" data-line-number="1084"></td>
+        <td id="LC1084" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">if</span> (counter &gt; <span class="pl-c1">0</span>) {</td>
+      </tr>
+      <tr>
+        <td id="L1085" class="blob-num js-line-number" data-line-number="1085"></td>
+        <td id="LC1085" class="blob-code blob-code-inner js-file-line">		counter--;</td>
+      </tr>
+      <tr>
+        <td id="L1086" class="blob-num js-line-number" data-line-number="1086"></td>
+        <td id="LC1086" class="blob-code blob-code-inner js-file-line">		<span class="pl-k">if</span> (counter == <span class="pl-c1">0</span>) {</td>
+      </tr>
+      <tr>
+        <td id="L1087" class="blob-num js-line-number" data-line-number="1087"></td>
+        <td id="LC1087" class="blob-code blob-code-inner js-file-line">			phase = <span class="pl-c1">0</span>;</td>
+      </tr>
+      <tr>
+        <td id="L1088" class="blob-num js-line-number" data-line-number="1088"></td>
+        <td id="LC1088" class="blob-code blob-code-inner js-file-line">		}</td>
+      </tr>
+      <tr>
+        <td id="L1089" class="blob-num js-line-number" data-line-number="1089"></td>
+        <td id="LC1089" class="blob-code blob-code-inner js-file-line">	}</td>
+      </tr>
+      <tr>
+        <td id="L1090" class="blob-num js-line-number" data-line-number="1090"></td>
+        <td id="LC1090" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L1091" class="blob-num js-line-number" data-line-number="1091"></td>
+        <td id="LC1091" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">if</span> (<span class="pl-c1">num_online_cpus</span>() &gt; <span class="pl-c1">1</span>) {</td>
+      </tr>
+      <tr>
+        <td id="L1092" class="blob-num js-line-number" data-line-number="1092"></td>
+        <td id="LC1092" class="blob-code blob-code-inner js-file-line">		<span class="pl-k">if</span> (max_load_other_cpu &gt;</td>
+      </tr>
+      <tr>
+        <td id="L1093" class="blob-num js-line-number" data-line-number="1093"></td>
+        <td id="LC1093" class="blob-code blob-code-inner js-file-line">				dbs_tuners_ins.<span class="pl-smi">up_threshold_any_cpu_load</span>) {</td>
+      </tr>
+      <tr>
+        <td id="L1094" class="blob-num js-line-number" data-line-number="1094"></td>
+        <td id="LC1094" class="blob-code blob-code-inner js-file-line">			<span class="pl-k">if</span> (policy-&gt;cur &lt; dbs_tuners_ins.<span class="pl-smi">sync_freq</span>)</td>
+      </tr>
+      <tr>
+        <td id="L1095" class="blob-num js-line-number" data-line-number="1095"></td>
+        <td id="LC1095" class="blob-code blob-code-inner js-file-line">				<span class="pl-c1">dbs_freq_increase</span>(policy,</td>
+      </tr>
+      <tr>
+        <td id="L1096" class="blob-num js-line-number" data-line-number="1096"></td>
+        <td id="LC1096" class="blob-code blob-code-inner js-file-line">						dbs_tuners_ins.<span class="pl-smi">sync_freq</span>);</td>
+      </tr>
+      <tr>
+        <td id="L1097" class="blob-num js-line-number" data-line-number="1097"></td>
+        <td id="LC1097" class="blob-code blob-code-inner js-file-line">			<span class="pl-k">return</span>;</td>
+      </tr>
+      <tr>
+        <td id="L1098" class="blob-num js-line-number" data-line-number="1098"></td>
+        <td id="LC1098" class="blob-code blob-code-inner js-file-line">		}</td>
+      </tr>
+      <tr>
+        <td id="L1099" class="blob-num js-line-number" data-line-number="1099"></td>
+        <td id="LC1099" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L1100" class="blob-num js-line-number" data-line-number="1100"></td>
+        <td id="LC1100" class="blob-code blob-code-inner js-file-line">		<span class="pl-k">if</span> (max_load_freq &gt; (dbs_tuners_ins.<span class="pl-smi">up_threshold_multi_core</span> *</td>
+      </tr>
+      <tr>
+        <td id="L1101" class="blob-num js-line-number" data-line-number="1101"></td>
+        <td id="LC1101" class="blob-code blob-code-inner js-file-line">								policy-&gt;cur)) {</td>
+      </tr>
+      <tr>
+        <td id="L1102" class="blob-num js-line-number" data-line-number="1102"></td>
+        <td id="LC1102" class="blob-code blob-code-inner js-file-line">			<span class="pl-k">if</span> (policy-&gt;cur &lt; dbs_tuners_ins.<span class="pl-smi">optimal_freq</span>)</td>
+      </tr>
+      <tr>
+        <td id="L1103" class="blob-num js-line-number" data-line-number="1103"></td>
+        <td id="LC1103" class="blob-code blob-code-inner js-file-line">				<span class="pl-c1">dbs_freq_increase</span>(policy,</td>
+      </tr>
+      <tr>
+        <td id="L1104" class="blob-num js-line-number" data-line-number="1104"></td>
+        <td id="LC1104" class="blob-code blob-code-inner js-file-line">						dbs_tuners_ins.<span class="pl-smi">optimal_freq</span>);</td>
+      </tr>
+      <tr>
+        <td id="L1105" class="blob-num js-line-number" data-line-number="1105"></td>
+        <td id="LC1105" class="blob-code blob-code-inner js-file-line">			<span class="pl-k">return</span>;</td>
+      </tr>
+      <tr>
+        <td id="L1106" class="blob-num js-line-number" data-line-number="1106"></td>
+        <td id="LC1106" class="blob-code blob-code-inner js-file-line">		}</td>
+      </tr>
+      <tr>
+        <td id="L1107" class="blob-num js-line-number" data-line-number="1107"></td>
+        <td id="LC1107" class="blob-code blob-code-inner js-file-line">	}</td>
+      </tr>
+      <tr>
+        <td id="L1108" class="blob-num js-line-number" data-line-number="1108"></td>
+        <td id="LC1108" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L1109" class="blob-num js-line-number" data-line-number="1109"></td>
+        <td id="LC1109" class="blob-code blob-code-inner js-file-line">	<span class="pl-c">/* Check for frequency decrease */</span></td>
+      </tr>
+      <tr>
+        <td id="L1110" class="blob-num js-line-number" data-line-number="1110"></td>
+        <td id="LC1110" class="blob-code blob-code-inner js-file-line">	<span class="pl-c">/* if we cannot reduce the frequency anymore, break out early */</span></td>
+      </tr>
+      <tr>
+        <td id="L1111" class="blob-num js-line-number" data-line-number="1111"></td>
+        <td id="LC1111" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">if</span> (policy-&gt;cur == policy-&gt;min)</td>
+      </tr>
+      <tr>
+        <td id="L1112" class="blob-num js-line-number" data-line-number="1112"></td>
+        <td id="LC1112" class="blob-code blob-code-inner js-file-line">		<span class="pl-k">return</span>;</td>
+      </tr>
+      <tr>
+        <td id="L1113" class="blob-num js-line-number" data-line-number="1113"></td>
+        <td id="LC1113" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L1114" class="blob-num js-line-number" data-line-number="1114"></td>
+        <td id="LC1114" class="blob-code blob-code-inner js-file-line">	<span class="pl-c">/*</span></td>
+      </tr>
+      <tr>
+        <td id="L1115" class="blob-num js-line-number" data-line-number="1115"></td>
+        <td id="LC1115" class="blob-code blob-code-inner js-file-line"><span class="pl-c">	 * The optimal frequency is the frequency that is the lowest that</span></td>
+      </tr>
+      <tr>
+        <td id="L1116" class="blob-num js-line-number" data-line-number="1116"></td>
+        <td id="LC1116" class="blob-code blob-code-inner js-file-line"><span class="pl-c">	 * can support the current CPU usage without triggering the up</span></td>
+      </tr>
+      <tr>
+        <td id="L1117" class="blob-num js-line-number" data-line-number="1117"></td>
+        <td id="LC1117" class="blob-code blob-code-inner js-file-line"><span class="pl-c">	 * policy. To be safe, we focus 10 points under the threshold.</span></td>
+      </tr>
+      <tr>
+        <td id="L1118" class="blob-num js-line-number" data-line-number="1118"></td>
+        <td id="LC1118" class="blob-code blob-code-inner js-file-line"><span class="pl-c">	 */</span></td>
+      </tr>
+      <tr>
+        <td id="L1119" class="blob-num js-line-number" data-line-number="1119"></td>
+        <td id="LC1119" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">if</span> (max_load_freq &lt;</td>
+      </tr>
+      <tr>
+        <td id="L1120" class="blob-num js-line-number" data-line-number="1120"></td>
+        <td id="LC1120" class="blob-code blob-code-inner js-file-line">	    (dbs_tuners_ins.<span class="pl-smi">up_threshold</span> * policy-&gt;cur)) {</td>
+      </tr>
+      <tr>
+        <td id="L1121" class="blob-num js-line-number" data-line-number="1121"></td>
+        <td id="LC1121" class="blob-code blob-code-inner js-file-line">		<span class="pl-k">unsigned</span> <span class="pl-k">int</span> freq_next;</td>
+      </tr>
+      <tr>
+        <td id="L1122" class="blob-num js-line-number" data-line-number="1122"></td>
+        <td id="LC1122" class="blob-code blob-code-inner js-file-line">		freq_next = max_load_freq /</td>
+      </tr>
+      <tr>
+        <td id="L1123" class="blob-num js-line-number" data-line-number="1123"></td>
+        <td id="LC1123" class="blob-code blob-code-inner js-file-line">				(dbs_tuners_ins.<span class="pl-smi">up_threshold</span>);</td>
+      </tr>
+      <tr>
+        <td id="L1124" class="blob-num js-line-number" data-line-number="1124"></td>
+        <td id="LC1124" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L1125" class="blob-num js-line-number" data-line-number="1125"></td>
+        <td id="LC1125" class="blob-code blob-code-inner js-file-line">		<span class="pl-c">/* PATCH : SMART_UP */</span></td>
+      </tr>
+      <tr>
+        <td id="L1126" class="blob-num js-line-number" data-line-number="1126"></td>
+        <td id="LC1126" class="blob-code blob-code-inner js-file-line">		<span class="pl-k">if</span> (dbs_tuners_ins.<span class="pl-smi">smart_up</span> &amp;&amp; (core_j + <span class="pl-c1">1</span>) &gt;</td>
+      </tr>
+      <tr>
+        <td id="L1127" class="blob-num js-line-number" data-line-number="1127"></td>
+        <td id="LC1127" class="blob-code blob-code-inner js-file-line">					dbs_tuners_ins.<span class="pl-smi">smart_each_off</span>) {</td>
+      </tr>
+      <tr>
+        <td id="L1128" class="blob-num js-line-number" data-line-number="1128"></td>
+        <td id="LC1128" class="blob-code blob-code-inner js-file-line">			<span class="pl-k">if</span> (freq_next &gt;= dbs_tuners_ins.<span class="pl-smi">smart_high_slow_up_freq</span>) {</td>
+      </tr>
+      <tr>
+        <td id="L1129" class="blob-num js-line-number" data-line-number="1129"></td>
+        <td id="LC1129" class="blob-code blob-code-inner js-file-line">				<span class="pl-k">int</span> idx = hist_load_high[core_j].<span class="pl-smi">hist_load_cnt</span>;</td>
+      </tr>
+      <tr>
+        <td id="L1130" class="blob-num js-line-number" data-line-number="1130"></td>
+        <td id="LC1130" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L1131" class="blob-num js-line-number" data-line-number="1131"></td>
+        <td id="LC1131" class="blob-code blob-code-inner js-file-line">				<span class="pl-k">if</span> (idx &gt;= dbs_tuners_ins.<span class="pl-smi">smart_high_slow_up_dur</span>)</td>
+      </tr>
+      <tr>
+        <td id="L1132" class="blob-num js-line-number" data-line-number="1132"></td>
+        <td id="LC1132" class="blob-code blob-code-inner js-file-line">					idx = <span class="pl-c1">0</span>;</td>
+      </tr>
+      <tr>
+        <td id="L1133" class="blob-num js-line-number" data-line-number="1133"></td>
+        <td id="LC1133" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L1134" class="blob-num js-line-number" data-line-number="1134"></td>
+        <td id="LC1134" class="blob-code blob-code-inner js-file-line">				hist_load_high[core_j].<span class="pl-smi">hist_max_load</span>[idx] = max_load;</td>
+      </tr>
+      <tr>
+        <td id="L1135" class="blob-num js-line-number" data-line-number="1135"></td>
+        <td id="LC1135" class="blob-code blob-code-inner js-file-line">				hist_load_high[core_j].<span class="pl-smi">hist_load_cnt</span> = idx + <span class="pl-c1">1</span>;</td>
+      </tr>
+      <tr>
+        <td id="L1136" class="blob-num js-line-number" data-line-number="1136"></td>
+        <td id="LC1136" class="blob-code blob-code-inner js-file-line">			} <span class="pl-k">else</span> <span class="pl-k">if</span> (freq_next &gt;= dbs_tuners_ins.<span class="pl-smi">smart_slow_up_freq</span>) {</td>
+      </tr>
+      <tr>
+        <td id="L1137" class="blob-num js-line-number" data-line-number="1137"></td>
+        <td id="LC1137" class="blob-code blob-code-inner js-file-line">				<span class="pl-k">int</span> idx = hist_load[core_j].<span class="pl-smi">hist_load_cnt</span>;</td>
+      </tr>
+      <tr>
+        <td id="L1138" class="blob-num js-line-number" data-line-number="1138"></td>
+        <td id="LC1138" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L1139" class="blob-num js-line-number" data-line-number="1139"></td>
+        <td id="LC1139" class="blob-code blob-code-inner js-file-line">				<span class="pl-k">if</span> (idx &gt;= dbs_tuners_ins.<span class="pl-smi">smart_slow_up_dur</span>)</td>
+      </tr>
+      <tr>
+        <td id="L1140" class="blob-num js-line-number" data-line-number="1140"></td>
+        <td id="LC1140" class="blob-code blob-code-inner js-file-line">					idx = <span class="pl-c1">0</span>;</td>
+      </tr>
+      <tr>
+        <td id="L1141" class="blob-num js-line-number" data-line-number="1141"></td>
+        <td id="LC1141" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L1142" class="blob-num js-line-number" data-line-number="1142"></td>
+        <td id="LC1142" class="blob-code blob-code-inner js-file-line">				hist_load[core_j].<span class="pl-smi">hist_max_load</span>[idx] = max_load;</td>
+      </tr>
+      <tr>
+        <td id="L1143" class="blob-num js-line-number" data-line-number="1143"></td>
+        <td id="LC1143" class="blob-code blob-code-inner js-file-line">				hist_load[core_j].<span class="pl-smi">hist_load_cnt</span> = idx + <span class="pl-c1">1</span>;</td>
+      </tr>
+      <tr>
+        <td id="L1144" class="blob-num js-line-number" data-line-number="1144"></td>
+        <td id="LC1144" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L1145" class="blob-num js-line-number" data-line-number="1145"></td>
+        <td id="LC1145" class="blob-code blob-code-inner js-file-line">				<span class="pl-c1">reset_hist_high</span>(&amp;hist_load_high[core_j]);</td>
+      </tr>
+      <tr>
+        <td id="L1146" class="blob-num js-line-number" data-line-number="1146"></td>
+        <td id="LC1146" class="blob-code blob-code-inner js-file-line">			} <span class="pl-k">else</span> <span class="pl-k">if</span> (policy-&gt;cur &gt;= dbs_tuners_ins.<span class="pl-smi">smart_slow_up_freq</span>) {</td>
+      </tr>
+      <tr>
+        <td id="L1147" class="blob-num js-line-number" data-line-number="1147"></td>
+        <td id="LC1147" class="blob-code blob-code-inner js-file-line">				<span class="pl-c1">reset_hist</span>(&amp;hist_load[core_j]);</td>
+      </tr>
+      <tr>
+        <td id="L1148" class="blob-num js-line-number" data-line-number="1148"></td>
+        <td id="LC1148" class="blob-code blob-code-inner js-file-line">				<span class="pl-c1">reset_hist_high</span>(&amp;hist_load_high[core_j]);</td>
+      </tr>
+      <tr>
+        <td id="L1149" class="blob-num js-line-number" data-line-number="1149"></td>
+        <td id="LC1149" class="blob-code blob-code-inner js-file-line">			}</td>
+      </tr>
+      <tr>
+        <td id="L1150" class="blob-num js-line-number" data-line-number="1150"></td>
+        <td id="LC1150" class="blob-code blob-code-inner js-file-line">		}</td>
+      </tr>
+      <tr>
+        <td id="L1151" class="blob-num js-line-number" data-line-number="1151"></td>
+        <td id="LC1151" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L1152" class="blob-num js-line-number" data-line-number="1152"></td>
+        <td id="LC1152" class="blob-code blob-code-inner js-file-line">		<span class="pl-c">/* No longer fully busy, reset rate_mult */</span></td>
+      </tr>
+      <tr>
+        <td id="L1153" class="blob-num js-line-number" data-line-number="1153"></td>
+        <td id="LC1153" class="blob-code blob-code-inner js-file-line">		this_dbs_info-&gt;rate_mult = <span class="pl-c1">1</span>;</td>
+      </tr>
+      <tr>
+        <td id="L1154" class="blob-num js-line-number" data-line-number="1154"></td>
+        <td id="LC1154" class="blob-code blob-code-inner js-file-line">		this_dbs_info-&gt;freq_stay_count = <span class="pl-c1">1</span>;</td>
+      </tr>
+      <tr>
+        <td id="L1155" class="blob-num js-line-number" data-line-number="1155"></td>
+        <td id="LC1155" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L1156" class="blob-num js-line-number" data-line-number="1156"></td>
+        <td id="LC1156" class="blob-code blob-code-inner js-file-line">		<span class="pl-k">if</span> (<span class="pl-c1">num_online_cpus</span>() &gt; <span class="pl-c1">1</span>) {</td>
+      </tr>
+      <tr>
+        <td id="L1157" class="blob-num js-line-number" data-line-number="1157"></td>
+        <td id="LC1157" class="blob-code blob-code-inner js-file-line">			<span class="pl-k">if</span> (max_load_other_cpu &gt;</td>
+      </tr>
+      <tr>
+        <td id="L1158" class="blob-num js-line-number" data-line-number="1158"></td>
+        <td id="LC1158" class="blob-code blob-code-inner js-file-line">				dbs_tuners_ins.<span class="pl-smi">up_threshold_multi_core</span> &amp;&amp;</td>
+      </tr>
+      <tr>
+        <td id="L1159" class="blob-num js-line-number" data-line-number="1159"></td>
+        <td id="LC1159" class="blob-code blob-code-inner js-file-line">					freq_next &lt; dbs_tuners_ins.<span class="pl-smi">sync_freq</span>)</td>
+      </tr>
+      <tr>
+        <td id="L1160" class="blob-num js-line-number" data-line-number="1160"></td>
+        <td id="LC1160" class="blob-code blob-code-inner js-file-line">				freq_next = dbs_tuners_ins.<span class="pl-smi">sync_freq</span>;</td>
+      </tr>
+      <tr>
+        <td id="L1161" class="blob-num js-line-number" data-line-number="1161"></td>
+        <td id="LC1161" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L1162" class="blob-num js-line-number" data-line-number="1162"></td>
+        <td id="LC1162" class="blob-code blob-code-inner js-file-line">			<span class="pl-k">if</span> (max_load_freq &gt;</td>
+      </tr>
+      <tr>
+        <td id="L1163" class="blob-num js-line-number" data-line-number="1163"></td>
+        <td id="LC1163" class="blob-code blob-code-inner js-file-line">					(dbs_tuners_ins.<span class="pl-smi">up_threshold_multi_core</span> *</td>
+      </tr>
+      <tr>
+        <td id="L1164" class="blob-num js-line-number" data-line-number="1164"></td>
+        <td id="LC1164" class="blob-code blob-code-inner js-file-line">					policy-&gt;cur) &amp;&amp;</td>
+      </tr>
+      <tr>
+        <td id="L1165" class="blob-num js-line-number" data-line-number="1165"></td>
+        <td id="LC1165" class="blob-code blob-code-inner js-file-line">					freq_next &lt; dbs_tuners_ins.<span class="pl-smi">optimal_freq</span>)</td>
+      </tr>
+      <tr>
+        <td id="L1166" class="blob-num js-line-number" data-line-number="1166"></td>
+        <td id="LC1166" class="blob-code blob-code-inner js-file-line">				freq_next = dbs_tuners_ins.<span class="pl-smi">optimal_freq</span>;</td>
+      </tr>
+      <tr>
+        <td id="L1167" class="blob-num js-line-number" data-line-number="1167"></td>
+        <td id="LC1167" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L1168" class="blob-num js-line-number" data-line-number="1168"></td>
+        <td id="LC1168" class="blob-code blob-code-inner js-file-line">		}</td>
+      </tr>
+      <tr>
+        <td id="L1169" class="blob-num js-line-number" data-line-number="1169"></td>
+        <td id="LC1169" class="blob-code blob-code-inner js-file-line">		<span class="pl-c1">__cpufreq_driver_target</span>(policy, freq_next,</td>
+      </tr>
+      <tr>
+        <td id="L1170" class="blob-num js-line-number" data-line-number="1170"></td>
+        <td id="LC1170" class="blob-code blob-code-inner js-file-line">				CPUFREQ_RELATION_L);</td>
+      </tr>
+      <tr>
+        <td id="L1171" class="blob-num js-line-number" data-line-number="1171"></td>
+        <td id="LC1171" class="blob-code blob-code-inner js-file-line">	}</td>
+      </tr>
+      <tr>
+        <td id="L1172" class="blob-num js-line-number" data-line-number="1172"></td>
+        <td id="LC1172" class="blob-code blob-code-inner js-file-line">}</td>
+      </tr>
+      <tr>
+        <td id="L1173" class="blob-num js-line-number" data-line-number="1173"></td>
+        <td id="LC1173" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L1174" class="blob-num js-line-number" data-line-number="1174"></td>
+        <td id="LC1174" class="blob-code blob-code-inner js-file-line"><span class="pl-k">static</span> <span class="pl-k">void</span> <span class="pl-en">do_dbs_timer</span>(<span class="pl-k">struct</span> work_struct *work)</td>
+      </tr>
+      <tr>
+        <td id="L1175" class="blob-num js-line-number" data-line-number="1175"></td>
+        <td id="LC1175" class="blob-code blob-code-inner js-file-line">{</td>
+      </tr>
+      <tr>
+        <td id="L1176" class="blob-num js-line-number" data-line-number="1176"></td>
+        <td id="LC1176" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">struct</span> cpu_dbs_info_s *dbs_info =</td>
+      </tr>
+      <tr>
+        <td id="L1177" class="blob-num js-line-number" data-line-number="1177"></td>
+        <td id="LC1177" class="blob-code blob-code-inner js-file-line">		<span class="pl-c1">container_of</span>(work, <span class="pl-k">struct</span> cpu_dbs_info_s, work.<span class="pl-smi">work</span>);</td>
+      </tr>
+      <tr>
+        <td id="L1178" class="blob-num js-line-number" data-line-number="1178"></td>
+        <td id="LC1178" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">int</span> sample_type = dbs_info-&gt;sample_type;</td>
+      </tr>
+      <tr>
+        <td id="L1179" class="blob-num js-line-number" data-line-number="1179"></td>
+        <td id="LC1179" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">int</span> delay;</td>
+      </tr>
+      <tr>
+        <td id="L1180" class="blob-num js-line-number" data-line-number="1180"></td>
+        <td id="LC1180" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L1181" class="blob-num js-line-number" data-line-number="1181"></td>
+        <td id="LC1181" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">if</span> (<span class="pl-c1">unlikely</span>(!<span class="pl-c1">cpu_online</span>(dbs_info-&gt;cpu) || !dbs_info-&gt;cur_policy))</td>
+      </tr>
+      <tr>
+        <td id="L1182" class="blob-num js-line-number" data-line-number="1182"></td>
+        <td id="LC1182" class="blob-code blob-code-inner js-file-line">		<span class="pl-k">return</span>;</td>
+      </tr>
+      <tr>
+        <td id="L1183" class="blob-num js-line-number" data-line-number="1183"></td>
+        <td id="LC1183" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L1184" class="blob-num js-line-number" data-line-number="1184"></td>
+        <td id="LC1184" class="blob-code blob-code-inner js-file-line">	<span class="pl-c1">mutex_lock</span>(&amp;dbs_info-&gt;timer_mutex);</td>
+      </tr>
+      <tr>
+        <td id="L1185" class="blob-num js-line-number" data-line-number="1185"></td>
+        <td id="LC1185" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L1186" class="blob-num js-line-number" data-line-number="1186"></td>
+        <td id="LC1186" class="blob-code blob-code-inner js-file-line">	<span class="pl-c">/* Common NORMAL_SAMPLE setup */</span></td>
+      </tr>
+      <tr>
+        <td id="L1187" class="blob-num js-line-number" data-line-number="1187"></td>
+        <td id="LC1187" class="blob-code blob-code-inner js-file-line">	dbs_info-&gt;sample_type = DBS_NORMAL_SAMPLE;</td>
+      </tr>
+      <tr>
+        <td id="L1188" class="blob-num js-line-number" data-line-number="1188"></td>
+        <td id="LC1188" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">if</span> (sample_type == DBS_NORMAL_SAMPLE) {</td>
+      </tr>
+      <tr>
+        <td id="L1189" class="blob-num js-line-number" data-line-number="1189"></td>
+        <td id="LC1189" class="blob-code blob-code-inner js-file-line">		<span class="pl-c1">dbs_check_cpu</span>(dbs_info);</td>
+      </tr>
+      <tr>
+        <td id="L1190" class="blob-num js-line-number" data-line-number="1190"></td>
+        <td id="LC1190" class="blob-code blob-code-inner js-file-line">		<span class="pl-k">if</span> (dbs_info-&gt;freq_lo) {</td>
+      </tr>
+      <tr>
+        <td id="L1191" class="blob-num js-line-number" data-line-number="1191"></td>
+        <td id="LC1191" class="blob-code blob-code-inner js-file-line">			<span class="pl-c">/* Setup timer for SUB_SAMPLE */</span></td>
+      </tr>
+      <tr>
+        <td id="L1192" class="blob-num js-line-number" data-line-number="1192"></td>
+        <td id="LC1192" class="blob-code blob-code-inner js-file-line">			dbs_info-&gt;sample_type = DBS_SUB_SAMPLE;</td>
+      </tr>
+      <tr>
+        <td id="L1193" class="blob-num js-line-number" data-line-number="1193"></td>
+        <td id="LC1193" class="blob-code blob-code-inner js-file-line">			delay = dbs_info-&gt;freq_hi_jiffies;</td>
+      </tr>
+      <tr>
+        <td id="L1194" class="blob-num js-line-number" data-line-number="1194"></td>
+        <td id="LC1194" class="blob-code blob-code-inner js-file-line">		} <span class="pl-k">else</span> {</td>
+      </tr>
+      <tr>
+        <td id="L1195" class="blob-num js-line-number" data-line-number="1195"></td>
+        <td id="LC1195" class="blob-code blob-code-inner js-file-line">			delay = <span class="pl-c1">usecs_to_jiffies</span>(dbs_tuners_ins.<span class="pl-smi">sampling_rate</span></td>
+      </tr>
+      <tr>
+        <td id="L1196" class="blob-num js-line-number" data-line-number="1196"></td>
+        <td id="LC1196" class="blob-code blob-code-inner js-file-line">				* dbs_info-&gt;rate_mult);</td>
+      </tr>
+      <tr>
+        <td id="L1197" class="blob-num js-line-number" data-line-number="1197"></td>
+        <td id="LC1197" class="blob-code blob-code-inner js-file-line">		}</td>
+      </tr>
+      <tr>
+        <td id="L1198" class="blob-num js-line-number" data-line-number="1198"></td>
+        <td id="LC1198" class="blob-code blob-code-inner js-file-line">	} <span class="pl-k">else</span> {</td>
+      </tr>
+      <tr>
+        <td id="L1199" class="blob-num js-line-number" data-line-number="1199"></td>
+        <td id="LC1199" class="blob-code blob-code-inner js-file-line">		<span class="pl-c1">__cpufreq_driver_target</span>(dbs_info-&gt;cur_policy,</td>
+      </tr>
+      <tr>
+        <td id="L1200" class="blob-num js-line-number" data-line-number="1200"></td>
+        <td id="LC1200" class="blob-code blob-code-inner js-file-line">			dbs_info-&gt;freq_lo, CPUFREQ_RELATION_H);</td>
+      </tr>
+      <tr>
+        <td id="L1201" class="blob-num js-line-number" data-line-number="1201"></td>
+        <td id="LC1201" class="blob-code blob-code-inner js-file-line">		delay = dbs_info-&gt;freq_lo_jiffies;</td>
+      </tr>
+      <tr>
+        <td id="L1202" class="blob-num js-line-number" data-line-number="1202"></td>
+        <td id="LC1202" class="blob-code blob-code-inner js-file-line">	}</td>
+      </tr>
+      <tr>
+        <td id="L1203" class="blob-num js-line-number" data-line-number="1203"></td>
+        <td id="LC1203" class="blob-code blob-code-inner js-file-line">	<span class="pl-c1">queue_delayed_work_on</span>(dbs_info-&gt;cpu, dbs_wq, &amp;dbs_info-&gt;work, delay);</td>
+      </tr>
+      <tr>
+        <td id="L1204" class="blob-num js-line-number" data-line-number="1204"></td>
+        <td id="LC1204" class="blob-code blob-code-inner js-file-line">	<span class="pl-c1">mutex_unlock</span>(&amp;dbs_info-&gt;timer_mutex);</td>
+      </tr>
+      <tr>
+        <td id="L1205" class="blob-num js-line-number" data-line-number="1205"></td>
+        <td id="LC1205" class="blob-code blob-code-inner js-file-line">}</td>
+      </tr>
+      <tr>
+        <td id="L1206" class="blob-num js-line-number" data-line-number="1206"></td>
+        <td id="LC1206" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L1207" class="blob-num js-line-number" data-line-number="1207"></td>
+        <td id="LC1207" class="blob-code blob-code-inner js-file-line"><span class="pl-k">static</span> <span class="pl-k">inline</span> <span class="pl-k">void</span> <span class="pl-en">dbs_timer_init</span>(<span class="pl-k">struct</span> cpu_dbs_info_s *dbs_info)</td>
+      </tr>
+      <tr>
+        <td id="L1208" class="blob-num js-line-number" data-line-number="1208"></td>
+        <td id="LC1208" class="blob-code blob-code-inner js-file-line">{</td>
+      </tr>
+      <tr>
+        <td id="L1209" class="blob-num js-line-number" data-line-number="1209"></td>
+        <td id="LC1209" class="blob-code blob-code-inner js-file-line">	<span class="pl-c">/* We want all CPUs to do sampling nearly on same jiffy */</span></td>
+      </tr>
+      <tr>
+        <td id="L1210" class="blob-num js-line-number" data-line-number="1210"></td>
+        <td id="LC1210" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">int</span> delay = <span class="pl-c1">usecs_to_jiffies</span>(dbs_tuners_ins.<span class="pl-smi">sampling_rate</span>);</td>
+      </tr>
+      <tr>
+        <td id="L1211" class="blob-num js-line-number" data-line-number="1211"></td>
+        <td id="LC1211" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L1212" class="blob-num js-line-number" data-line-number="1212"></td>
+        <td id="LC1212" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">if</span> (<span class="pl-c1">num_online_cpus</span>() &gt; <span class="pl-c1">1</span>)</td>
+      </tr>
+      <tr>
+        <td id="L1213" class="blob-num js-line-number" data-line-number="1213"></td>
+        <td id="LC1213" class="blob-code blob-code-inner js-file-line">		delay -= jiffies % delay;</td>
+      </tr>
+      <tr>
+        <td id="L1214" class="blob-num js-line-number" data-line-number="1214"></td>
+        <td id="LC1214" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L1215" class="blob-num js-line-number" data-line-number="1215"></td>
+        <td id="LC1215" class="blob-code blob-code-inner js-file-line">	dbs_info-&gt;sample_type = DBS_NORMAL_SAMPLE;</td>
+      </tr>
+      <tr>
+        <td id="L1216" class="blob-num js-line-number" data-line-number="1216"></td>
+        <td id="LC1216" class="blob-code blob-code-inner js-file-line">	<span class="pl-c1">INIT_DEFERRABLE_WORK</span>(&amp;dbs_info-&gt;work, do_dbs_timer);</td>
+      </tr>
+      <tr>
+        <td id="L1217" class="blob-num js-line-number" data-line-number="1217"></td>
+        <td id="LC1217" class="blob-code blob-code-inner js-file-line">	<span class="pl-c1">queue_delayed_work_on</span>(dbs_info-&gt;cpu, dbs_wq, &amp;dbs_info-&gt;work, delay);</td>
+      </tr>
+      <tr>
+        <td id="L1218" class="blob-num js-line-number" data-line-number="1218"></td>
+        <td id="LC1218" class="blob-code blob-code-inner js-file-line">}</td>
+      </tr>
+      <tr>
+        <td id="L1219" class="blob-num js-line-number" data-line-number="1219"></td>
+        <td id="LC1219" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L1220" class="blob-num js-line-number" data-line-number="1220"></td>
+        <td id="LC1220" class="blob-code blob-code-inner js-file-line"><span class="pl-k">static</span> <span class="pl-k">inline</span> <span class="pl-k">void</span> <span class="pl-en">dbs_timer_exit</span>(<span class="pl-k">struct</span> cpu_dbs_info_s *dbs_info)</td>
+      </tr>
+      <tr>
+        <td id="L1221" class="blob-num js-line-number" data-line-number="1221"></td>
+        <td id="LC1221" class="blob-code blob-code-inner js-file-line">{</td>
+      </tr>
+      <tr>
+        <td id="L1222" class="blob-num js-line-number" data-line-number="1222"></td>
+        <td id="LC1222" class="blob-code blob-code-inner js-file-line">	<span class="pl-c1">cancel_delayed_work_sync</span>(&amp;dbs_info-&gt;work);</td>
+      </tr>
+      <tr>
+        <td id="L1223" class="blob-num js-line-number" data-line-number="1223"></td>
+        <td id="LC1223" class="blob-code blob-code-inner js-file-line">}</td>
+      </tr>
+      <tr>
+        <td id="L1224" class="blob-num js-line-number" data-line-number="1224"></td>
+        <td id="LC1224" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L1225" class="blob-num js-line-number" data-line-number="1225"></td>
+        <td id="LC1225" class="blob-code blob-code-inner js-file-line"><span class="pl-k">static</span> <span class="pl-k">int</span> <span class="pl-en">cpufreq_governor_dbs</span>(<span class="pl-k">struct</span> cpufreq_policy *policy,</td>
+      </tr>
+      <tr>
+        <td id="L1226" class="blob-num js-line-number" data-line-number="1226"></td>
+        <td id="LC1226" class="blob-code blob-code-inner js-file-line">				   <span class="pl-k">unsigned</span> <span class="pl-k">int</span> event)</td>
+      </tr>
+      <tr>
+        <td id="L1227" class="blob-num js-line-number" data-line-number="1227"></td>
+        <td id="LC1227" class="blob-code blob-code-inner js-file-line">{</td>
+      </tr>
+      <tr>
+        <td id="L1228" class="blob-num js-line-number" data-line-number="1228"></td>
+        <td id="LC1228" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">unsigned</span> <span class="pl-k">int</span> cpu = policy-&gt;cpu;</td>
+      </tr>
+      <tr>
+        <td id="L1229" class="blob-num js-line-number" data-line-number="1229"></td>
+        <td id="LC1229" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">struct</span> cpu_dbs_info_s *this_dbs_info;</td>
+      </tr>
+      <tr>
+        <td id="L1230" class="blob-num js-line-number" data-line-number="1230"></td>
+        <td id="LC1230" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">unsigned</span> <span class="pl-k">int</span> j;</td>
+      </tr>
+      <tr>
+        <td id="L1231" class="blob-num js-line-number" data-line-number="1231"></td>
+        <td id="LC1231" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">int</span> rc;</td>
+      </tr>
+      <tr>
+        <td id="L1232" class="blob-num js-line-number" data-line-number="1232"></td>
+        <td id="LC1232" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L1233" class="blob-num js-line-number" data-line-number="1233"></td>
+        <td id="LC1233" class="blob-code blob-code-inner js-file-line">	this_dbs_info = &amp;<span class="pl-c1">per_cpu</span>(id_cpu_dbs_info, cpu);</td>
+      </tr>
+      <tr>
+        <td id="L1234" class="blob-num js-line-number" data-line-number="1234"></td>
+        <td id="LC1234" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L1235" class="blob-num js-line-number" data-line-number="1235"></td>
+        <td id="LC1235" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">switch</span> (event) {</td>
+      </tr>
+      <tr>
+        <td id="L1236" class="blob-num js-line-number" data-line-number="1236"></td>
+        <td id="LC1236" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">case</span> CPUFREQ_GOV_START:</td>
+      </tr>
+      <tr>
+        <td id="L1237" class="blob-num js-line-number" data-line-number="1237"></td>
+        <td id="LC1237" class="blob-code blob-code-inner js-file-line">		<span class="pl-k">if</span> ((!<span class="pl-c1">cpu_online</span>(cpu)) || (!policy))</td>
+      </tr>
+      <tr>
+        <td id="L1238" class="blob-num js-line-number" data-line-number="1238"></td>
+        <td id="LC1238" class="blob-code blob-code-inner js-file-line">			<span class="pl-k">return</span> -EINVAL;</td>
+      </tr>
+      <tr>
+        <td id="L1239" class="blob-num js-line-number" data-line-number="1239"></td>
+        <td id="LC1239" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L1240" class="blob-num js-line-number" data-line-number="1240"></td>
+        <td id="LC1240" class="blob-code blob-code-inner js-file-line">		<span class="pl-c1">mutex_lock</span>(&amp;dbs_mutex);</td>
+      </tr>
+      <tr>
+        <td id="L1241" class="blob-num js-line-number" data-line-number="1241"></td>
+        <td id="LC1241" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L1242" class="blob-num js-line-number" data-line-number="1242"></td>
+        <td id="LC1242" class="blob-code blob-code-inner js-file-line">		dbs_enable++;</td>
+      </tr>
+      <tr>
+        <td id="L1243" class="blob-num js-line-number" data-line-number="1243"></td>
+        <td id="LC1243" class="blob-code blob-code-inner js-file-line">		<span class="pl-c1">for_each_cpu</span>(j, policy-&gt;cpus) {</td>
+      </tr>
+      <tr>
+        <td id="L1244" class="blob-num js-line-number" data-line-number="1244"></td>
+        <td id="LC1244" class="blob-code blob-code-inner js-file-line">			<span class="pl-k">struct</span> cpu_dbs_info_s *j_dbs_info;</td>
+      </tr>
+      <tr>
+        <td id="L1245" class="blob-num js-line-number" data-line-number="1245"></td>
+        <td id="LC1245" class="blob-code blob-code-inner js-file-line">			<span class="pl-k">unsigned</span> <span class="pl-k">int</span> prev_load;</td>
+      </tr>
+      <tr>
+        <td id="L1246" class="blob-num js-line-number" data-line-number="1246"></td>
+        <td id="LC1246" class="blob-code blob-code-inner js-file-line">			j_dbs_info = &amp;<span class="pl-c1">per_cpu</span>(id_cpu_dbs_info, j);</td>
+      </tr>
+      <tr>
+        <td id="L1247" class="blob-num js-line-number" data-line-number="1247"></td>
+        <td id="LC1247" class="blob-code blob-code-inner js-file-line">			j_dbs_info-&gt;cur_policy = policy;</td>
+      </tr>
+      <tr>
+        <td id="L1248" class="blob-num js-line-number" data-line-number="1248"></td>
+        <td id="LC1248" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L1249" class="blob-num js-line-number" data-line-number="1249"></td>
+        <td id="LC1249" class="blob-code blob-code-inner js-file-line">			j_dbs_info-&gt;prev_cpu_idle = <span class="pl-c1">get_cpu_idle_time</span>(j,</td>
+      </tr>
+      <tr>
+        <td id="L1250" class="blob-num js-line-number" data-line-number="1250"></td>
+        <td id="LC1250" class="blob-code blob-code-inner js-file-line">						&amp;j_dbs_info-&gt;prev_cpu_wall,</td>
+      </tr>
+      <tr>
+        <td id="L1251" class="blob-num js-line-number" data-line-number="1251"></td>
+        <td id="LC1251" class="blob-code blob-code-inner js-file-line">						<span class="pl-c1">0</span>);</td>
+      </tr>
+      <tr>
+        <td id="L1252" class="blob-num js-line-number" data-line-number="1252"></td>
+        <td id="LC1252" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L1253" class="blob-num js-line-number" data-line-number="1253"></td>
+        <td id="LC1253" class="blob-code blob-code-inner js-file-line">			prev_load = (<span class="pl-k">unsigned</span> <span class="pl-k">int</span>)</td>
+      </tr>
+      <tr>
+        <td id="L1254" class="blob-num js-line-number" data-line-number="1254"></td>
+        <td id="LC1254" class="blob-code blob-code-inner js-file-line">				(j_dbs_info-&gt;prev_cpu_wall - j_dbs_info-&gt;prev_cpu_idle);</td>
+      </tr>
+      <tr>
+        <td id="L1255" class="blob-num js-line-number" data-line-number="1255"></td>
+        <td id="LC1255" class="blob-code blob-code-inner js-file-line">			j_dbs_info-&gt;prev_load = <span class="pl-c1">100</span> * prev_load /</td>
+      </tr>
+      <tr>
+        <td id="L1256" class="blob-num js-line-number" data-line-number="1256"></td>
+        <td id="LC1256" class="blob-code blob-code-inner js-file-line">				(<span class="pl-k">unsigned</span> <span class="pl-k">int</span>) j_dbs_info-&gt;prev_cpu_wall;</td>
+      </tr>
+      <tr>
+        <td id="L1257" class="blob-num js-line-number" data-line-number="1257"></td>
+        <td id="LC1257" class="blob-code blob-code-inner js-file-line">		}</td>
+      </tr>
+      <tr>
+        <td id="L1258" class="blob-num js-line-number" data-line-number="1258"></td>
+        <td id="LC1258" class="blob-code blob-code-inner js-file-line">		cpu = policy-&gt;cpu;</td>
+      </tr>
+      <tr>
+        <td id="L1259" class="blob-num js-line-number" data-line-number="1259"></td>
+        <td id="LC1259" class="blob-code blob-code-inner js-file-line">		this_dbs_info-&gt;cpu = cpu;</td>
+      </tr>
+      <tr>
+        <td id="L1260" class="blob-num js-line-number" data-line-number="1260"></td>
+        <td id="LC1260" class="blob-code blob-code-inner js-file-line">		this_dbs_info-&gt;rate_mult = <span class="pl-c1">1</span>;</td>
+      </tr>
+      <tr>
+        <td id="L1261" class="blob-num js-line-number" data-line-number="1261"></td>
+        <td id="LC1261" class="blob-code blob-code-inner js-file-line">		this_dbs_info-&gt;freq_stay_count = <span class="pl-c1">1</span>;</td>
+      </tr>
+      <tr>
+        <td id="L1262" class="blob-num js-line-number" data-line-number="1262"></td>
+        <td id="LC1262" class="blob-code blob-code-inner js-file-line">		<span class="pl-c">/*</span></td>
+      </tr>
+      <tr>
+        <td id="L1263" class="blob-num js-line-number" data-line-number="1263"></td>
+        <td id="LC1263" class="blob-code blob-code-inner js-file-line"><span class="pl-c">		 * Start the timerschedule work, when this governor</span></td>
+      </tr>
+      <tr>
+        <td id="L1264" class="blob-num js-line-number" data-line-number="1264"></td>
+        <td id="LC1264" class="blob-code blob-code-inner js-file-line"><span class="pl-c">		 * is used for first time</span></td>
+      </tr>
+      <tr>
+        <td id="L1265" class="blob-num js-line-number" data-line-number="1265"></td>
+        <td id="LC1265" class="blob-code blob-code-inner js-file-line"><span class="pl-c">		 */</span></td>
+      </tr>
+      <tr>
+        <td id="L1266" class="blob-num js-line-number" data-line-number="1266"></td>
+        <td id="LC1266" class="blob-code blob-code-inner js-file-line">		<span class="pl-k">if</span> (dbs_enable == <span class="pl-c1">1</span>) {</td>
+      </tr>
+      <tr>
+        <td id="L1267" class="blob-num js-line-number" data-line-number="1267"></td>
+        <td id="LC1267" class="blob-code blob-code-inner js-file-line">			<span class="pl-k">unsigned</span> <span class="pl-k">int</span> latency;</td>
+      </tr>
+      <tr>
+        <td id="L1268" class="blob-num js-line-number" data-line-number="1268"></td>
+        <td id="LC1268" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L1269" class="blob-num js-line-number" data-line-number="1269"></td>
+        <td id="LC1269" class="blob-code blob-code-inner js-file-line">			rc = <span class="pl-c1">sysfs_create_group</span>(cpufreq_global_kobject,</td>
+      </tr>
+      <tr>
+        <td id="L1270" class="blob-num js-line-number" data-line-number="1270"></td>
+        <td id="LC1270" class="blob-code blob-code-inner js-file-line">						&amp;dbs_attr_group);</td>
+      </tr>
+      <tr>
+        <td id="L1271" class="blob-num js-line-number" data-line-number="1271"></td>
+        <td id="LC1271" class="blob-code blob-code-inner js-file-line">			<span class="pl-k">if</span> (rc) {</td>
+      </tr>
+      <tr>
+        <td id="L1272" class="blob-num js-line-number" data-line-number="1272"></td>
+        <td id="LC1272" class="blob-code blob-code-inner js-file-line">				dbs_enable--;</td>
+      </tr>
+      <tr>
+        <td id="L1273" class="blob-num js-line-number" data-line-number="1273"></td>
+        <td id="LC1273" class="blob-code blob-code-inner js-file-line">				<span class="pl-c1">mutex_unlock</span>(&amp;dbs_mutex);</td>
+      </tr>
+      <tr>
+        <td id="L1274" class="blob-num js-line-number" data-line-number="1274"></td>
+        <td id="LC1274" class="blob-code blob-code-inner js-file-line">				<span class="pl-k">return</span> rc;</td>
+      </tr>
+      <tr>
+        <td id="L1275" class="blob-num js-line-number" data-line-number="1275"></td>
+        <td id="LC1275" class="blob-code blob-code-inner js-file-line">			}</td>
+      </tr>
+      <tr>
+        <td id="L1276" class="blob-num js-line-number" data-line-number="1276"></td>
+        <td id="LC1276" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L1277" class="blob-num js-line-number" data-line-number="1277"></td>
+        <td id="LC1277" class="blob-code blob-code-inner js-file-line">			<span class="pl-c">/* policy latency is in nS. Convert it to uS first */</span></td>
+      </tr>
+      <tr>
+        <td id="L1278" class="blob-num js-line-number" data-line-number="1278"></td>
+        <td id="LC1278" class="blob-code blob-code-inner js-file-line">			latency = policy-&gt;cpuinfo.<span class="pl-smi">transition_latency</span> / <span class="pl-c1">1000</span>;</td>
+      </tr>
+      <tr>
+        <td id="L1279" class="blob-num js-line-number" data-line-number="1279"></td>
+        <td id="LC1279" class="blob-code blob-code-inner js-file-line">			<span class="pl-k">if</span> (latency == <span class="pl-c1">0</span>)</td>
+      </tr>
+      <tr>
+        <td id="L1280" class="blob-num js-line-number" data-line-number="1280"></td>
+        <td id="LC1280" class="blob-code blob-code-inner js-file-line">				latency = <span class="pl-c1">1</span>;</td>
+      </tr>
+      <tr>
+        <td id="L1281" class="blob-num js-line-number" data-line-number="1281"></td>
+        <td id="LC1281" class="blob-code blob-code-inner js-file-line">			<span class="pl-c">/* Bring kernel and HW constraints together */</span></td>
+      </tr>
+      <tr>
+        <td id="L1282" class="blob-num js-line-number" data-line-number="1282"></td>
+        <td id="LC1282" class="blob-code blob-code-inner js-file-line">			min_sampling_rate = <span class="pl-c1">max</span>(min_sampling_rate,</td>
+      </tr>
+      <tr>
+        <td id="L1283" class="blob-num js-line-number" data-line-number="1283"></td>
+        <td id="LC1283" class="blob-code blob-code-inner js-file-line">					MIN_LATENCY_MULTIPLIER * latency);</td>
+      </tr>
+      <tr>
+        <td id="L1284" class="blob-num js-line-number" data-line-number="1284"></td>
+        <td id="LC1284" class="blob-code blob-code-inner js-file-line">			<span class="pl-k">if</span> (latency != <span class="pl-c1">1</span>)</td>
+      </tr>
+      <tr>
+        <td id="L1285" class="blob-num js-line-number" data-line-number="1285"></td>
+        <td id="LC1285" class="blob-code blob-code-inner js-file-line">				dbs_tuners_ins.<span class="pl-smi">sampling_rate</span> =</td>
+      </tr>
+      <tr>
+        <td id="L1286" class="blob-num js-line-number" data-line-number="1286"></td>
+        <td id="LC1286" class="blob-code blob-code-inner js-file-line">					<span class="pl-c1">max</span>(dbs_tuners_ins.<span class="pl-smi">sampling_rate</span>,</td>
+      </tr>
+      <tr>
+        <td id="L1287" class="blob-num js-line-number" data-line-number="1287"></td>
+        <td id="LC1287" class="blob-code blob-code-inner js-file-line">						latency * LATENCY_MULTIPLIER);</td>
+      </tr>
+      <tr>
+        <td id="L1288" class="blob-num js-line-number" data-line-number="1288"></td>
+        <td id="LC1288" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L1289" class="blob-num js-line-number" data-line-number="1289"></td>
+        <td id="LC1289" class="blob-code blob-code-inner js-file-line">			<span class="pl-k">if</span> (dbs_tuners_ins.<span class="pl-smi">optimal_freq</span> == <span class="pl-c1">0</span>)</td>
+      </tr>
+      <tr>
+        <td id="L1290" class="blob-num js-line-number" data-line-number="1290"></td>
+        <td id="LC1290" class="blob-code blob-code-inner js-file-line">				dbs_tuners_ins.<span class="pl-smi">optimal_freq</span> = policy-&gt;min;</td>
+      </tr>
+      <tr>
+        <td id="L1291" class="blob-num js-line-number" data-line-number="1291"></td>
+        <td id="LC1291" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L1292" class="blob-num js-line-number" data-line-number="1292"></td>
+        <td id="LC1292" class="blob-code blob-code-inner js-file-line">			<span class="pl-k">if</span> (dbs_tuners_ins.<span class="pl-smi">sync_freq</span> == <span class="pl-c1">0</span>)</td>
+      </tr>
+      <tr>
+        <td id="L1293" class="blob-num js-line-number" data-line-number="1293"></td>
+        <td id="LC1293" class="blob-code blob-code-inner js-file-line">				dbs_tuners_ins.<span class="pl-smi">sync_freq</span> = policy-&gt;min;</td>
+      </tr>
+      <tr>
+        <td id="L1294" class="blob-num js-line-number" data-line-number="1294"></td>
+        <td id="LC1294" class="blob-code blob-code-inner js-file-line">		}</td>
+      </tr>
+      <tr>
+        <td id="L1295" class="blob-num js-line-number" data-line-number="1295"></td>
+        <td id="LC1295" class="blob-code blob-code-inner js-file-line">		<span class="pl-c1">mutex_unlock</span>(&amp;dbs_mutex);</td>
+      </tr>
+      <tr>
+        <td id="L1296" class="blob-num js-line-number" data-line-number="1296"></td>
+        <td id="LC1296" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L1297" class="blob-num js-line-number" data-line-number="1297"></td>
+        <td id="LC1297" class="blob-code blob-code-inner js-file-line">		<span class="pl-c1">dbs_timer_init</span>(this_dbs_info);</td>
+      </tr>
+      <tr>
+        <td id="L1298" class="blob-num js-line-number" data-line-number="1298"></td>
+        <td id="LC1298" class="blob-code blob-code-inner js-file-line">		<span class="pl-k">break</span>;</td>
+      </tr>
+      <tr>
+        <td id="L1299" class="blob-num js-line-number" data-line-number="1299"></td>
+        <td id="LC1299" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L1300" class="blob-num js-line-number" data-line-number="1300"></td>
+        <td id="LC1300" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">case</span> CPUFREQ_GOV_STOP:</td>
+      </tr>
+      <tr>
+        <td id="L1301" class="blob-num js-line-number" data-line-number="1301"></td>
+        <td id="LC1301" class="blob-code blob-code-inner js-file-line">		<span class="pl-c1">dbs_timer_exit</span>(this_dbs_info);</td>
+      </tr>
+      <tr>
+        <td id="L1302" class="blob-num js-line-number" data-line-number="1302"></td>
+        <td id="LC1302" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L1303" class="blob-num js-line-number" data-line-number="1303"></td>
+        <td id="LC1303" class="blob-code blob-code-inner js-file-line">		<span class="pl-c1">mutex_lock</span>(&amp;dbs_mutex);</td>
+      </tr>
+      <tr>
+        <td id="L1304" class="blob-num js-line-number" data-line-number="1304"></td>
+        <td id="LC1304" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L1305" class="blob-num js-line-number" data-line-number="1305"></td>
+        <td id="LC1305" class="blob-code blob-code-inner js-file-line">		dbs_enable--;</td>
+      </tr>
+      <tr>
+        <td id="L1306" class="blob-num js-line-number" data-line-number="1306"></td>
+        <td id="LC1306" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L1307" class="blob-num js-line-number" data-line-number="1307"></td>
+        <td id="LC1307" class="blob-code blob-code-inner js-file-line">		<span class="pl-c">/* If device is being removed, policy is no longer</span></td>
+      </tr>
+      <tr>
+        <td id="L1308" class="blob-num js-line-number" data-line-number="1308"></td>
+        <td id="LC1308" class="blob-code blob-code-inner js-file-line"><span class="pl-c">		 * valid. */</span></td>
+      </tr>
+      <tr>
+        <td id="L1309" class="blob-num js-line-number" data-line-number="1309"></td>
+        <td id="LC1309" class="blob-code blob-code-inner js-file-line">		this_dbs_info-&gt;cur_policy = <span class="pl-c1">NULL</span>;</td>
+      </tr>
+      <tr>
+        <td id="L1310" class="blob-num js-line-number" data-line-number="1310"></td>
+        <td id="LC1310" class="blob-code blob-code-inner js-file-line">		<span class="pl-k">if</span> (!dbs_enable)</td>
+      </tr>
+      <tr>
+        <td id="L1311" class="blob-num js-line-number" data-line-number="1311"></td>
+        <td id="LC1311" class="blob-code blob-code-inner js-file-line">			<span class="pl-c1">sysfs_remove_group</span>(cpufreq_global_kobject,</td>
+      </tr>
+      <tr>
+        <td id="L1312" class="blob-num js-line-number" data-line-number="1312"></td>
+        <td id="LC1312" class="blob-code blob-code-inner js-file-line">					   &amp;dbs_attr_group);</td>
+      </tr>
+      <tr>
+        <td id="L1313" class="blob-num js-line-number" data-line-number="1313"></td>
+        <td id="LC1313" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L1314" class="blob-num js-line-number" data-line-number="1314"></td>
+        <td id="LC1314" class="blob-code blob-code-inner js-file-line">		<span class="pl-c1">mutex_unlock</span>(&amp;dbs_mutex);</td>
+      </tr>
+      <tr>
+        <td id="L1315" class="blob-num js-line-number" data-line-number="1315"></td>
+        <td id="LC1315" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L1316" class="blob-num js-line-number" data-line-number="1316"></td>
+        <td id="LC1316" class="blob-code blob-code-inner js-file-line">		<span class="pl-k">break</span>;</td>
+      </tr>
+      <tr>
+        <td id="L1317" class="blob-num js-line-number" data-line-number="1317"></td>
+        <td id="LC1317" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L1318" class="blob-num js-line-number" data-line-number="1318"></td>
+        <td id="LC1318" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">case</span> CPUFREQ_GOV_LIMITS:</td>
+      </tr>
+      <tr>
+        <td id="L1319" class="blob-num js-line-number" data-line-number="1319"></td>
+        <td id="LC1319" class="blob-code blob-code-inner js-file-line">		<span class="pl-c">/* If device is being removed, skip set limits */</span></td>
+      </tr>
+      <tr>
+        <td id="L1320" class="blob-num js-line-number" data-line-number="1320"></td>
+        <td id="LC1320" class="blob-code blob-code-inner js-file-line">		<span class="pl-k">if</span> (!this_dbs_info-&gt;cur_policy)</td>
+      </tr>
+      <tr>
+        <td id="L1321" class="blob-num js-line-number" data-line-number="1321"></td>
+        <td id="LC1321" class="blob-code blob-code-inner js-file-line">			<span class="pl-k">break</span>;</td>
+      </tr>
+      <tr>
+        <td id="L1322" class="blob-num js-line-number" data-line-number="1322"></td>
+        <td id="LC1322" class="blob-code blob-code-inner js-file-line">		<span class="pl-c1">mutex_lock</span>(&amp;this_dbs_info-&gt;timer_mutex);</td>
+      </tr>
+      <tr>
+        <td id="L1323" class="blob-num js-line-number" data-line-number="1323"></td>
+        <td id="LC1323" class="blob-code blob-code-inner js-file-line">		<span class="pl-c1">__cpufreq_driver_target</span>(this_dbs_info-&gt;cur_policy,</td>
+      </tr>
+      <tr>
+        <td id="L1324" class="blob-num js-line-number" data-line-number="1324"></td>
+        <td id="LC1324" class="blob-code blob-code-inner js-file-line">				policy-&gt;cur, CPUFREQ_RELATION_L);</td>
+      </tr>
+      <tr>
+        <td id="L1325" class="blob-num js-line-number" data-line-number="1325"></td>
+        <td id="LC1325" class="blob-code blob-code-inner js-file-line">		<span class="pl-c1">dbs_check_cpu</span>(this_dbs_info);</td>
+      </tr>
+      <tr>
+        <td id="L1326" class="blob-num js-line-number" data-line-number="1326"></td>
+        <td id="LC1326" class="blob-code blob-code-inner js-file-line">		<span class="pl-c1">mutex_unlock</span>(&amp;this_dbs_info-&gt;timer_mutex);</td>
+      </tr>
+      <tr>
+        <td id="L1327" class="blob-num js-line-number" data-line-number="1327"></td>
+        <td id="LC1327" class="blob-code blob-code-inner js-file-line">		<span class="pl-k">break</span>;</td>
+      </tr>
+      <tr>
+        <td id="L1328" class="blob-num js-line-number" data-line-number="1328"></td>
+        <td id="LC1328" class="blob-code blob-code-inner js-file-line">	}</td>
+      </tr>
+      <tr>
+        <td id="L1329" class="blob-num js-line-number" data-line-number="1329"></td>
+        <td id="LC1329" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">return</span> <span class="pl-c1">0</span>;</td>
+      </tr>
+      <tr>
+        <td id="L1330" class="blob-num js-line-number" data-line-number="1330"></td>
+        <td id="LC1330" class="blob-code blob-code-inner js-file-line">}</td>
+      </tr>
+      <tr>
+        <td id="L1331" class="blob-num js-line-number" data-line-number="1331"></td>
+        <td id="LC1331" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L1332" class="blob-num js-line-number" data-line-number="1332"></td>
+        <td id="LC1332" class="blob-code blob-code-inner js-file-line">#<span class="pl-k">ifndef</span> CONFIG_CPU_FREQ_DEFAULT_GOV_INTELLIDEMAND</td>
+      </tr>
+      <tr>
+        <td id="L1333" class="blob-num js-line-number" data-line-number="1333"></td>
+        <td id="LC1333" class="blob-code blob-code-inner js-file-line"><span class="pl-k">static</span></td>
+      </tr>
+      <tr>
+        <td id="L1334" class="blob-num js-line-number" data-line-number="1334"></td>
+        <td id="LC1334" class="blob-code blob-code-inner js-file-line">#<span class="pl-k">endif</span></td>
+      </tr>
+      <tr>
+        <td id="L1335" class="blob-num js-line-number" data-line-number="1335"></td>
+        <td id="LC1335" class="blob-code blob-code-inner js-file-line"><span class="pl-k">struct</span> cpufreq_governor cpufreq_gov_intellidemand = {</td>
+      </tr>
+      <tr>
+        <td id="L1336" class="blob-num js-line-number" data-line-number="1336"></td>
+        <td id="LC1336" class="blob-code blob-code-inner js-file-line">	.<span class="pl-smi">name</span>			= <span class="pl-s"><span class="pl-pds">&quot;</span>intellidemand<span class="pl-pds">&quot;</span></span>,</td>
+      </tr>
+      <tr>
+        <td id="L1337" class="blob-num js-line-number" data-line-number="1337"></td>
+        <td id="LC1337" class="blob-code blob-code-inner js-file-line">	.<span class="pl-smi">governor</span>		= cpufreq_governor_dbs,</td>
+      </tr>
+      <tr>
+        <td id="L1338" class="blob-num js-line-number" data-line-number="1338"></td>
+        <td id="LC1338" class="blob-code blob-code-inner js-file-line">	.<span class="pl-smi">max_transition_latency</span>	= TRANSITION_LATENCY_LIMIT,</td>
+      </tr>
+      <tr>
+        <td id="L1339" class="blob-num js-line-number" data-line-number="1339"></td>
+        <td id="LC1339" class="blob-code blob-code-inner js-file-line">	.<span class="pl-smi">owner</span>			= THIS_MODULE,</td>
+      </tr>
+      <tr>
+        <td id="L1340" class="blob-num js-line-number" data-line-number="1340"></td>
+        <td id="LC1340" class="blob-code blob-code-inner js-file-line">};</td>
+      </tr>
+      <tr>
+        <td id="L1341" class="blob-num js-line-number" data-line-number="1341"></td>
+        <td id="LC1341" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L1342" class="blob-num js-line-number" data-line-number="1342"></td>
+        <td id="LC1342" class="blob-code blob-code-inner js-file-line"><span class="pl-k">static</span> <span class="pl-k">int</span> __init <span class="pl-en">cpufreq_gov_dbs_init</span>(<span class="pl-k">void</span>)</td>
+      </tr>
+      <tr>
+        <td id="L1343" class="blob-num js-line-number" data-line-number="1343"></td>
+        <td id="LC1343" class="blob-code blob-code-inner js-file-line">{</td>
+      </tr>
+      <tr>
+        <td id="L1344" class="blob-num js-line-number" data-line-number="1344"></td>
+        <td id="LC1344" class="blob-code blob-code-inner js-file-line">	u64 idle_time;</td>
+      </tr>
+      <tr>
+        <td id="L1345" class="blob-num js-line-number" data-line-number="1345"></td>
+        <td id="LC1345" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">unsigned</span> <span class="pl-k">int</span> i;</td>
+      </tr>
+      <tr>
+        <td id="L1346" class="blob-num js-line-number" data-line-number="1346"></td>
+        <td id="LC1346" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">int</span> cpu = <span class="pl-c1">get_cpu</span>();</td>
+      </tr>
+      <tr>
+        <td id="L1347" class="blob-num js-line-number" data-line-number="1347"></td>
+        <td id="LC1347" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L1348" class="blob-num js-line-number" data-line-number="1348"></td>
+        <td id="LC1348" class="blob-code blob-code-inner js-file-line">	idle_time = <span class="pl-c1">get_cpu_idle_time_us</span>(cpu, <span class="pl-c1">NULL</span>);</td>
+      </tr>
+      <tr>
+        <td id="L1349" class="blob-num js-line-number" data-line-number="1349"></td>
+        <td id="LC1349" class="blob-code blob-code-inner js-file-line">	<span class="pl-c1">put_cpu</span>();</td>
+      </tr>
+      <tr>
+        <td id="L1350" class="blob-num js-line-number" data-line-number="1350"></td>
+        <td id="LC1350" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">if</span> (idle_time != -<span class="pl-c1">1ULL</span>) {</td>
+      </tr>
+      <tr>
+        <td id="L1351" class="blob-num js-line-number" data-line-number="1351"></td>
+        <td id="LC1351" class="blob-code blob-code-inner js-file-line">		<span class="pl-c">/* Idle micro accounting is supported. Use finer thresholds */</span></td>
+      </tr>
+      <tr>
+        <td id="L1352" class="blob-num js-line-number" data-line-number="1352"></td>
+        <td id="LC1352" class="blob-code blob-code-inner js-file-line">		dbs_tuners_ins.<span class="pl-smi">up_threshold</span> = MICRO_FREQUENCY_UP_THRESHOLD;</td>
+      </tr>
+      <tr>
+        <td id="L1353" class="blob-num js-line-number" data-line-number="1353"></td>
+        <td id="LC1353" class="blob-code blob-code-inner js-file-line">		<span class="pl-c">/*</span></td>
+      </tr>
+      <tr>
+        <td id="L1354" class="blob-num js-line-number" data-line-number="1354"></td>
+        <td id="LC1354" class="blob-code blob-code-inner js-file-line"><span class="pl-c">		 * In nohz/micro accounting case we set the minimum frequency</span></td>
+      </tr>
+      <tr>
+        <td id="L1355" class="blob-num js-line-number" data-line-number="1355"></td>
+        <td id="LC1355" class="blob-code blob-code-inner js-file-line"><span class="pl-c">		 * not depending on HZ, but fixed (very low). The deferred</span></td>
+      </tr>
+      <tr>
+        <td id="L1356" class="blob-num js-line-number" data-line-number="1356"></td>
+        <td id="LC1356" class="blob-code blob-code-inner js-file-line"><span class="pl-c">		 * timer might skip some samples if idle/sleeping as needed.</span></td>
+      </tr>
+      <tr>
+        <td id="L1357" class="blob-num js-line-number" data-line-number="1357"></td>
+        <td id="LC1357" class="blob-code blob-code-inner js-file-line"><span class="pl-c">		*/</span></td>
+      </tr>
+      <tr>
+        <td id="L1358" class="blob-num js-line-number" data-line-number="1358"></td>
+        <td id="LC1358" class="blob-code blob-code-inner js-file-line">		min_sampling_rate = MICRO_FREQUENCY_MIN_SAMPLE_RATE;</td>
+      </tr>
+      <tr>
+        <td id="L1359" class="blob-num js-line-number" data-line-number="1359"></td>
+        <td id="LC1359" class="blob-code blob-code-inner js-file-line">	} <span class="pl-k">else</span> {</td>
+      </tr>
+      <tr>
+        <td id="L1360" class="blob-num js-line-number" data-line-number="1360"></td>
+        <td id="LC1360" class="blob-code blob-code-inner js-file-line">		<span class="pl-c">/* For correct statistics, we need 10 ticks for each measure */</span></td>
+      </tr>
+      <tr>
+        <td id="L1361" class="blob-num js-line-number" data-line-number="1361"></td>
+        <td id="LC1361" class="blob-code blob-code-inner js-file-line">		min_sampling_rate =</td>
+      </tr>
+      <tr>
+        <td id="L1362" class="blob-num js-line-number" data-line-number="1362"></td>
+        <td id="LC1362" class="blob-code blob-code-inner js-file-line">			MIN_SAMPLING_RATE_RATIO * <span class="pl-c1">jiffies_to_usecs</span>(<span class="pl-c1">10</span>);</td>
+      </tr>
+      <tr>
+        <td id="L1363" class="blob-num js-line-number" data-line-number="1363"></td>
+        <td id="LC1363" class="blob-code blob-code-inner js-file-line">	}</td>
+      </tr>
+      <tr>
+        <td id="L1364" class="blob-num js-line-number" data-line-number="1364"></td>
+        <td id="LC1364" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L1365" class="blob-num js-line-number" data-line-number="1365"></td>
+        <td id="LC1365" class="blob-code blob-code-inner js-file-line">	dbs_wq = <span class="pl-c1">alloc_workqueue</span>(<span class="pl-s"><span class="pl-pds">&quot;</span>intellidemand_dbs_wq<span class="pl-pds">&quot;</span></span>, WQ_HIGHPRI, <span class="pl-c1">0</span>);</td>
+      </tr>
+      <tr>
+        <td id="L1366" class="blob-num js-line-number" data-line-number="1366"></td>
+        <td id="LC1366" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">if</span> (!dbs_wq) {</td>
+      </tr>
+      <tr>
+        <td id="L1367" class="blob-num js-line-number" data-line-number="1367"></td>
+        <td id="LC1367" class="blob-code blob-code-inner js-file-line">		<span class="pl-c1">printk</span>(KERN_ERR <span class="pl-s"><span class="pl-pds">&quot;</span>Failed to create intellidemand_dbs_wq workqueue<span class="pl-cce">\n</span><span class="pl-pds">&quot;</span></span>);</td>
+      </tr>
+      <tr>
+        <td id="L1368" class="blob-num js-line-number" data-line-number="1368"></td>
+        <td id="LC1368" class="blob-code blob-code-inner js-file-line">		<span class="pl-k">return</span> -EFAULT;</td>
+      </tr>
+      <tr>
+        <td id="L1369" class="blob-num js-line-number" data-line-number="1369"></td>
+        <td id="LC1369" class="blob-code blob-code-inner js-file-line">	}</td>
+      </tr>
+      <tr>
+        <td id="L1370" class="blob-num js-line-number" data-line-number="1370"></td>
+        <td id="LC1370" class="blob-code blob-code-inner js-file-line">	<span class="pl-c1">for_each_possible_cpu</span>(i) {</td>
+      </tr>
+      <tr>
+        <td id="L1371" class="blob-num js-line-number" data-line-number="1371"></td>
+        <td id="LC1371" class="blob-code blob-code-inner js-file-line">		<span class="pl-k">struct</span> cpu_dbs_info_s *this_dbs_info =</td>
+      </tr>
+      <tr>
+        <td id="L1372" class="blob-num js-line-number" data-line-number="1372"></td>
+        <td id="LC1372" class="blob-code blob-code-inner js-file-line">			&amp;<span class="pl-c1">per_cpu</span>(id_cpu_dbs_info, i);</td>
+      </tr>
+      <tr>
+        <td id="L1373" class="blob-num js-line-number" data-line-number="1373"></td>
+        <td id="LC1373" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L1374" class="blob-num js-line-number" data-line-number="1374"></td>
+        <td id="LC1374" class="blob-code blob-code-inner js-file-line">		<span class="pl-c1">mutex_init</span>(&amp;this_dbs_info-&gt;timer_mutex);</td>
+      </tr>
+      <tr>
+        <td id="L1375" class="blob-num js-line-number" data-line-number="1375"></td>
+        <td id="LC1375" class="blob-code blob-code-inner js-file-line">	}</td>
+      </tr>
+      <tr>
+        <td id="L1376" class="blob-num js-line-number" data-line-number="1376"></td>
+        <td id="LC1376" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L1377" class="blob-num js-line-number" data-line-number="1377"></td>
+        <td id="LC1377" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">return</span> <span class="pl-c1">cpufreq_register_governor</span>(&amp;cpufreq_gov_intellidemand);</td>
+      </tr>
+      <tr>
+        <td id="L1378" class="blob-num js-line-number" data-line-number="1378"></td>
+        <td id="LC1378" class="blob-code blob-code-inner js-file-line">}</td>
+      </tr>
+      <tr>
+        <td id="L1379" class="blob-num js-line-number" data-line-number="1379"></td>
+        <td id="LC1379" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L1380" class="blob-num js-line-number" data-line-number="1380"></td>
+        <td id="LC1380" class="blob-code blob-code-inner js-file-line"><span class="pl-k">static</span> <span class="pl-k">void</span> __exit <span class="pl-en">cpufreq_gov_dbs_exit</span>(<span class="pl-k">void</span>)</td>
+      </tr>
+      <tr>
+        <td id="L1381" class="blob-num js-line-number" data-line-number="1381"></td>
+        <td id="LC1381" class="blob-code blob-code-inner js-file-line">{</td>
+      </tr>
+      <tr>
+        <td id="L1382" class="blob-num js-line-number" data-line-number="1382"></td>
+        <td id="LC1382" class="blob-code blob-code-inner js-file-line">	<span class="pl-k">unsigned</span> <span class="pl-k">int</span> i;</td>
+      </tr>
+      <tr>
+        <td id="L1383" class="blob-num js-line-number" data-line-number="1383"></td>
+        <td id="LC1383" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L1384" class="blob-num js-line-number" data-line-number="1384"></td>
+        <td id="LC1384" class="blob-code blob-code-inner js-file-line">	<span class="pl-c1">cpufreq_unregister_governor</span>(&amp;cpufreq_gov_intellidemand);</td>
+      </tr>
+      <tr>
+        <td id="L1385" class="blob-num js-line-number" data-line-number="1385"></td>
+        <td id="LC1385" class="blob-code blob-code-inner js-file-line">	<span class="pl-c1">for_each_possible_cpu</span>(i) {</td>
+      </tr>
+      <tr>
+        <td id="L1386" class="blob-num js-line-number" data-line-number="1386"></td>
+        <td id="LC1386" class="blob-code blob-code-inner js-file-line">		<span class="pl-k">struct</span> cpu_dbs_info_s *this_dbs_info =</td>
+      </tr>
+      <tr>
+        <td id="L1387" class="blob-num js-line-number" data-line-number="1387"></td>
+        <td id="LC1387" class="blob-code blob-code-inner js-file-line">			&amp;<span class="pl-c1">per_cpu</span>(id_cpu_dbs_info, i);</td>
+      </tr>
+      <tr>
+        <td id="L1388" class="blob-num js-line-number" data-line-number="1388"></td>
+        <td id="LC1388" class="blob-code blob-code-inner js-file-line">		<span class="pl-c1">mutex_destroy</span>(&amp;this_dbs_info-&gt;timer_mutex);</td>
+      </tr>
+      <tr>
+        <td id="L1389" class="blob-num js-line-number" data-line-number="1389"></td>
+        <td id="LC1389" class="blob-code blob-code-inner js-file-line">	}</td>
+      </tr>
+      <tr>
+        <td id="L1390" class="blob-num js-line-number" data-line-number="1390"></td>
+        <td id="LC1390" class="blob-code blob-code-inner js-file-line">	<span class="pl-c1">destroy_workqueue</span>(dbs_wq);</td>
+      </tr>
+      <tr>
+        <td id="L1391" class="blob-num js-line-number" data-line-number="1391"></td>
+        <td id="LC1391" class="blob-code blob-code-inner js-file-line">}</td>
+      </tr>
+      <tr>
+        <td id="L1392" class="blob-num js-line-number" data-line-number="1392"></td>
+        <td id="LC1392" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L1393" class="blob-num js-line-number" data-line-number="1393"></td>
+        <td id="LC1393" class="blob-code blob-code-inner js-file-line"><span class="pl-en">MODULE_AUTHOR</span>(<span class="pl-s"><span class="pl-pds">&quot;</span>Venkatesh Pallipadi &lt;venkatesh.pallipadi@intel.com&gt;<span class="pl-pds">&quot;</span></span>);</td>
+      </tr>
+      <tr>
+        <td id="L1394" class="blob-num js-line-number" data-line-number="1394"></td>
+        <td id="LC1394" class="blob-code blob-code-inner js-file-line"><span class="pl-en">MODULE_AUTHOR</span>(<span class="pl-s"><span class="pl-pds">&quot;</span>Alexey Starikovskiy &lt;alexey.y.starikovskiy@intel.com&gt;<span class="pl-pds">&quot;</span></span>);</td>
+      </tr>
+      <tr>
+        <td id="L1395" class="blob-num js-line-number" data-line-number="1395"></td>
+        <td id="LC1395" class="blob-code blob-code-inner js-file-line"><span class="pl-en">MODULE_AUTHOR</span>(<span class="pl-s"><span class="pl-pds">&quot;</span>Paul Reioux &lt;reioux@gmail.com&gt;<span class="pl-pds">&quot;</span></span>);</td>
+      </tr>
+      <tr>
+        <td id="L1396" class="blob-num js-line-number" data-line-number="1396"></td>
+        <td id="LC1396" class="blob-code blob-code-inner js-file-line"><span class="pl-en">MODULE_DESCRIPTION</span>(<span class="pl-s"><span class="pl-pds">&quot;</span>&#39;cpufreq_intellidemand&#39; - A dynamic cpufreq governor for <span class="pl-pds">&quot;</span></span></td>
+      </tr>
+      <tr>
+        <td id="L1397" class="blob-num js-line-number" data-line-number="1397"></td>
+        <td id="LC1397" class="blob-code blob-code-inner js-file-line">	<span class="pl-s"><span class="pl-pds">&quot;</span>Low Latency Frequency Transition capable processors<span class="pl-pds">&quot;</span></span>);</td>
+      </tr>
+      <tr>
+        <td id="L1398" class="blob-num js-line-number" data-line-number="1398"></td>
+        <td id="LC1398" class="blob-code blob-code-inner js-file-line"><span class="pl-en">MODULE_LICENSE</span>(<span class="pl-s"><span class="pl-pds">&quot;</span>GPL<span class="pl-pds">&quot;</span></span>);</td>
+      </tr>
+      <tr>
+        <td id="L1399" class="blob-num js-line-number" data-line-number="1399"></td>
+        <td id="LC1399" class="blob-code blob-code-inner js-file-line">
+</td>
+      </tr>
+      <tr>
+        <td id="L1400" class="blob-num js-line-number" data-line-number="1400"></td>
+        <td id="LC1400" class="blob-code blob-code-inner js-file-line">#<span class="pl-k">ifdef</span> CONFIG_CPU_FREQ_DEFAULT_GOV_INTELLIDEMAND</td>
+      </tr>
+      <tr>
+        <td id="L1401" class="blob-num js-line-number" data-line-number="1401"></td>
+        <td id="LC1401" class="blob-code blob-code-inner js-file-line"><span class="pl-en">fs_initcall</span>(cpufreq_gov_dbs_init);</td>
+      </tr>
+      <tr>
+        <td id="L1402" class="blob-num js-line-number" data-line-number="1402"></td>
+        <td id="LC1402" class="blob-code blob-code-inner js-file-line">#<span class="pl-k">else</span></td>
+      </tr>
+      <tr>
+        <td id="L1403" class="blob-num js-line-number" data-line-number="1403"></td>
+        <td id="LC1403" class="blob-code blob-code-inner js-file-line"><span class="pl-en">module_init</span>(cpufreq_gov_dbs_init);</td>
+      </tr>
+      <tr>
+        <td id="L1404" class="blob-num js-line-number" data-line-number="1404"></td>
+        <td id="LC1404" class="blob-code blob-code-inner js-file-line">#<span class="pl-k">endif</span></td>
+      </tr>
+      <tr>
+        <td id="L1405" class="blob-num js-line-number" data-line-number="1405"></td>
+        <td id="LC1405" class="blob-code blob-code-inner js-file-line"><span class="pl-en">module_exit</span>(cpufreq_gov_dbs_exit);</td>
+      </tr>
+</table>
+
+  </div>
+
+</div>
+
+<button type="button" data-facebox="#jump-to-line" data-facebox-class="linejump" data-hotkey="l" class="d-none">Jump to Line</button>
+<div id="jump-to-line" style="display:none">
+  <!-- '"` --><!-- </textarea></xmp> --></option></form><form accept-charset="UTF-8" action="" class="js-jump-to-line-form" method="get"><div style="margin:0;padding:0;display:inline"><input name="utf8" type="hidden" value="&#x2713;" /></div>
+    <input class="form-control linejump-input js-jump-to-line-field" type="text" placeholder="Jump to line&hellip;" aria-label="Jump to line" autofocus>
+    <button type="submit" class="btn">Go</button>
+</form></div>
+
+  </div>
+  <div class="modal-backdrop js-touch-events"></div>
+</div>
+
+
+    </div>
+  </div>
+
+    </div>
+
+        <div class="container site-footer-container">
+  <div class="site-footer" role="contentinfo">
+    <ul class="site-footer-links float-right">
+        <li><a href="https://github.com/contact" data-ga-click="Footer, go to contact, text:contact">Contact GitHub</a></li>
+      <li><a href="https://developer.github.com" data-ga-click="Footer, go to api, text:api">API</a></li>
+      <li><a href="https://training.github.com" data-ga-click="Footer, go to training, text:training">Training</a></li>
+      <li><a href="https://shop.github.com" data-ga-click="Footer, go to shop, text:shop">Shop</a></li>
+        <li><a href="https://github.com/blog" data-ga-click="Footer, go to blog, text:blog">Blog</a></li>
+        <li><a href="https://github.com/about" data-ga-click="Footer, go to about, text:about">About</a></li>
+
+    </ul>
+
+    <a href="https://github.com" aria-label="Homepage" class="site-footer-mark" title="GitHub">
+      <svg aria-hidden="true" class="octicon octicon-mark-github" height="24" version="1.1" viewBox="0 0 16 16" width="24"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0 0 16 8c0-4.42-3.58-8-8-8z"></path></svg>
+</a>
+    <ul class="site-footer-links">
+      <li>&copy; 2016 <span title="0.14188s from github-fe151-cp1-prd.iad.github.net">GitHub</span>, Inc.</li>
+        <li><a href="https://github.com/site/terms" data-ga-click="Footer, go to terms, text:terms">Terms</a></li>
+        <li><a href="https://github.com/site/privacy" data-ga-click="Footer, go to privacy, text:privacy">Privacy</a></li>
+        <li><a href="https://github.com/security" data-ga-click="Footer, go to security, text:security">Security</a></li>
+        <li><a href="https://status.github.com/" data-ga-click="Footer, go to status, text:status">Status</a></li>
+        <li><a href="https://help.github.com" data-ga-click="Footer, go to help, text:help">Help</a></li>
+    </ul>
+  </div>
+</div>
+
+
+
+    
+
+    <div id="ajax-error-message" class="ajax-error-message flash flash-error">
+      <svg aria-hidden="true" class="octicon octicon-alert" height="16" version="1.1" viewBox="0 0 16 16" width="16"><path d="M8.865 1.52c-.18-.31-.51-.5-.87-.5s-.69.19-.87.5L.275 13.5c-.18.31-.18.69 0 1 .19.31.52.5.87.5h13.7c.36 0 .69-.19.86-.5.17-.31.18-.69.01-1L8.865 1.52zM8.995 13h-2v-2h2v2zm0-3h-2V6h2v4z"></path></svg>
+      <button type="button" class="flash-close js-flash-close js-ajax-error-dismiss" aria-label="Dismiss error">
+        <svg aria-hidden="true" class="octicon octicon-x" height="16" version="1.1" viewBox="0 0 12 16" width="12"><path d="M7.48 8l3.75 3.75-1.48 1.48L6 9.48l-3.75 3.75-1.48-1.48L4.52 8 .77 4.25l1.48-1.48L6 6.52l3.75-3.75 1.48 1.48z"></path></svg>
+      </button>
+      You can't perform that action at this time.
+    </div>
+
+
+      
+      <script crossorigin="anonymous" integrity="sha256-vodwqcYrVg6GN3eFfluoWLYKD1z6QQdL+68xECcr85U=" src="https://assets-cdn.github.com/assets/frameworks-be8770a9c62b560e863777857e5ba858b60a0f5cfa41074bfbaf3110272bf395.js"></script>
+      <script async="async" crossorigin="anonymous" integrity="sha256-/FP2TgbkjLFZf3HSVx+fZevgQHmYgC7zRiECfooaAMQ=" src="https://assets-cdn.github.com/assets/github-fc53f64e06e48cb1597f71d2571f9f65ebe0407998802ef34621027e8a1a00c4.js"></script>
+      
+      
+      
+      
+      
+      
+    <div class="js-stale-session-flash stale-session-flash flash flash-warn flash-banner d-none">
+      <svg aria-hidden="true" class="octicon octicon-alert" height="16" version="1.1" viewBox="0 0 16 16" width="16"><path d="M8.865 1.52c-.18-.31-.51-.5-.87-.5s-.69.19-.87.5L.275 13.5c-.18.31-.18.69 0 1 .19.31.52.5.87.5h13.7c.36 0 .69-.19.86-.5.17-.31.18-.69.01-1L8.865 1.52zM8.995 13h-2v-2h2v2zm0-3h-2V6h2v4z"></path></svg>
+      <span class="signed-in-tab-flash">You signed in with another tab or window. <a href="">Reload</a> to refresh your session.</span>
+      <span class="signed-out-tab-flash">You signed out in another tab or window. <a href="">Reload</a> to refresh your session.</span>
+    </div>
+    <div class="facebox" id="facebox" style="display:none;">
+  <div class="facebox-popup">
+    <div class="facebox-content" role="dialog" aria-labelledby="facebox-header" aria-describedby="facebox-description">
+    </div>
+    <button type="button" class="facebox-close js-facebox-close" aria-label="Close modal">
+      <svg aria-hidden="true" class="octicon octicon-x" height="16" version="1.1" viewBox="0 0 12 16" width="12"><path d="M7.48 8l3.75 3.75-1.48 1.48L6 9.48l-3.75 3.75-1.48-1.48L4.52 8 .77 4.25l1.48-1.48L6 6.52l3.75-3.75 1.48 1.48z"></path></svg>
+    </button>
+  </div>
+</div>
+
+  </body>
+</html>
+
